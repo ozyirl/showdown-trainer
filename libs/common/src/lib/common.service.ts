@@ -6,4 +6,3 @@ export class CommonService {
     return 'Welcome from the shared common library!';
   }
 }
-
