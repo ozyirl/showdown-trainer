@@ -4,9 +4,10 @@ import { AppService } from './app.service';
 import { BattleController } from './battle.controller';
 import { BattleService } from './battle.service';
 import { OrgCommonModule } from '@org/common';
+import { BattleEngineModule } from '@org/battle-engine';
 
 @Module({
-  imports: [OrgCommonModule],
+  imports: [OrgCommonModule, BattleEngineModule],
   controllers: [AppController, BattleController],
   providers: [AppService, BattleService],
 })

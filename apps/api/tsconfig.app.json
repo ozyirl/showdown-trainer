@@ -23,6 +23,9 @@
   ],
   "references": [
     {
+      "path": "../../libs/battle-engine/tsconfig.lib.json"
+    },
+    {
       "path": "../../libs/common/tsconfig.lib.json"
     }
   ]
