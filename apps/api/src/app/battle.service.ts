@@ -299,22 +299,16 @@ export class BattleService {
 
   /**
    * Get available moves for a player
+   * Returns move indices 1-4 (simplified for random selection)
    */
   private getAvailableMoves(battle: any, playerId: string): number[] {
     try {
-      const request = battle.requests[playerId];
-      if (!request || !request.active || !request.active[0]) return [];
-
-      const active = request.active[0];
-      if (!active.moves) return [];
-
-      // Return move indices (1-based)
-      return active.moves
-        .map((_: any, index: number) => index + 1)
-        .filter((_: any, index: number) => !active.moves[index].disabled);
+      // For now, return all 4 move slots
+      // The battle engine will handle invalid moves
+      return [1, 2, 3, 4];
     } catch (error) {
       console.error('Error getting moves:', error);
-      return [1]; // Default to first move
+      return [1, 2, 3, 4];
     }
   }
 
