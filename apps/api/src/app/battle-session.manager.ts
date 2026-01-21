@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { Battle, Teams } from 'pokemon-showdown';
+import type { Battle } from 'pokemon-showdown';
 
 export interface BattleState {
   battleId: string;
@@ -200,19 +200,24 @@ export class BattleSessionManager {
       `P2 has active request BEFORE: ${!!battle.sides[1]?.activeRequest}`
     );
 
-    // Submit both choices to the battle engine
-    try {
-      let p1Result = false;
-      let p2Result = false;
+    const p1RequestState = battle.sides[0]?.requestState;
+    const p2RequestState = battle.sides[1]?.requestState;
+    if (p1RequestState !== 'move' || p2RequestState !== 'move') {
+      console.log(
+        `Battle not ready for moves (p1: ${p1RequestState}, p2: ${p2RequestState})`
+      );
+      return this.getBattleState(battleId);
+    }
 
-      if (session.p1MoveChoice) {
-        p1Result = battle.choose('p1', session.p1MoveChoice);
-        console.log(`P1 choice result: ${p1Result}`);
+    // Submit both choices to the battle engine in one pass
+    try {
+      const p1Choice = session.p1MoveChoice;
+      const p2Choice = session.p2MoveChoice;
+      if (!p1Choice || !p2Choice) {
+        throw new Error('Missing choices for one or both players');
       }
-      if (session.p2MoveChoice) {
-        p2Result = battle.choose('p2', session.p2MoveChoice);
-        console.log(`P2 choice result: ${p2Result}`);
-      }
+
+      battle.makeChoices(p1Choice, p2Choice);
 
       // Log battle state after choices
       console.log(
@@ -223,7 +228,13 @@ export class BattleSessionManager {
       );
     } catch (error) {
       console.error('Error submitting moves:', error);
-      // Clear choices even on error to prevent stuck state
+      const message =
+        error instanceof Error ? error.message : 'Unknown error';
+      if (message.includes('Not all choices done')) {
+        return this.getBattleState(battleId);
+      }
+
+      // Clear choices on other errors to prevent stuck state
       session.clearChoices();
       throw error;
     }
@@ -244,9 +255,9 @@ export class BattleSessionManager {
       );
       console.error('They will likely process on the next choose() call');
 
-      // This is a known Pokemon Showdown behavior - moves get queued but don't always
-      // process immediately. They'll execute when the next set of moves is submitted.
-      // For now, we'll continue normally and let the frontend retry.
+      // Moves can be queued without immediately processing. Keep choices
+      // so the next call can retry the same decisions.
+      return this.getBattleState(battleId);
     }
 
     // Capture NEW logs since last turn
