@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 
 export interface BattleLog {
   rawLog: string[];
@@ -7,80 +7,92 @@ export interface BattleLog {
   turns: number;
 }
 
+export interface PokemonListItem {
+  id: string;
+  name: string;
+  num: number;
+  types: string[];
+  tier?: string;
+  baseSpecies: string;
+  forme: string;
+}
+
+export interface PokemonMoveItem {
+  id: string;
+  name: string;
+  type: string;
+  category: string;
+  basePower: number;
+  accuracy: number | true;
+  pp: number;
+  priority: number;
+  target: string;
+}
+
+export interface StartBattleRequest {
+  p1Pokemon?: string;
+  p2Pokemon?: string;
+  p1Moves?: string[];
+  p2Moves?: string[];
+  level?: number;
+  formatid?: string;
+}
+
+interface BuiltPokemonSet {
+  set: any;
+  speciesName: string;
+  moves: string[];
+}
+
 @Injectable()
 export class BattleService {
   /**
-   * Simulates a 1v1 battle between Gengar and Charizard
-   * Based on: https://github.com/smogon/pokemon-showdown/blob/master/sim/README.md
+   * Simulates a 1v1 battle between two selectable Pokemon (defaults to Gengar vs Charizard)
    */
-  async simulateBattle(): Promise<BattleLog> {
-    // Dynamic import to avoid issues
+  async simulateBattle(config?: StartBattleRequest): Promise<BattleLog> {
     const { Battle, Teams } = await import('pokemon-showdown');
 
-    // Create teams using the Teams API
-    const gengarSet = {
-      name: 'Gengar',
-      species: 'Gengar',
-      item: 'Life Orb',
-      ability: 'Cursed Body',
-      moves: ['Shadow Ball', 'Sludge Bomb', 'Focus Blast', 'Thunderbolt'],
-      nature: 'Timid',
-      evs: { hp: 4, spa: 252, spe: 252 },
-      ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
-      level: 50,
-      gender: 'M',
-    };
-
-    const charizardSet = {
-      name: 'Charizard',
-      species: 'Charizard',
-      item: 'Choice Specs',
-      ability: 'Blaze',
-      moves: ['Fire Blast', 'Air Slash', 'Dragon Pulse', 'Heat Wave'],
-      nature: 'Timid',
-      evs: { hp: 4, spa: 252, spe: 252 },
-      ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
-      level: 50,
-      gender: 'F',
-    };
-
-    // Pack teams into showdown format
-    const p1Team = Teams.pack([gengarSet]);
-    const p2Team = Teams.pack([charizardSet]);
-
-    // Create battle
-    const battle = new Battle({
-      formatid: 'gen9ou',
+    const p1Built = await this.buildPokemonSet({
+      speciesName: config?.p1Pokemon ?? 'Gengar',
+      selectedMoves: config?.p1Moves,
+      level: config?.level,
+    });
+    const p2Built = await this.buildPokemonSet({
+      speciesName: config?.p2Pokemon ?? 'Charizard',
+      selectedMoves: config?.p2Moves,
+      level: config?.level,
     });
 
-    // Set up players (battle starts automatically after both players are set)
+    const p1Team = Teams.pack([p1Built.set]);
+    const p2Team = Teams.pack([p2Built.set]);
+
+    const battle = new Battle({
+      formatid: config?.formatid ?? 'gen9customgame',
+    });
+
     battle.setPlayer('p1', {
-      name: 'Gengar Trainer',
+      name: `${p1Built.speciesName} Trainer`,
       team: p1Team,
     });
 
     battle.setPlayer('p2', {
-      name: 'Charizard Trainer',
+      name: `${p2Built.speciesName} Trainer`,
       team: p2Team,
     });
 
-    // Handle team preview (both players select team 1 - we only have 1 pokemon each)
     battle.choose('p1', 'team 1');
     battle.choose('p2', 'team 1');
 
-    // Simulate turns with random moves
     let turn = 0;
-    const maxTurns = 20;
+    const maxTurns = 40;
 
     while (!battle.ended && turn < maxTurns) {
-      // Get available moves for each player
       const p1Moves = this.getAvailableMoves(battle, 'p1');
       const p2Moves = this.getAvailableMoves(battle, 'p2');
 
       if (p1Moves.length > 0 && p2Moves.length > 0) {
         const p1Move = p1Moves[Math.floor(Math.random() * p1Moves.length)];
         const p2Move = p2Moves[Math.floor(Math.random() * p2Moves.length)];
-
         battle.choose('p1', `move ${p1Move}`);
         battle.choose('p2', `move ${p2Move}`);
       } else {
@@ -91,13 +103,8 @@ export class BattleService {
       turn++;
     }
 
-    // Get the battle log (this contains all the protocol messages)
     const rawLog = battle.log;
-
-    // Format the log for human readability
     const formattedLog = this.formatBattleLog(rawLog);
-
-    // Get winner
     const winner = battle.winner || 'Draw';
 
     return {
@@ -108,213 +115,72 @@ export class BattleService {
     };
   }
 
-  /**
-   * Format battle log into human-readable text
-   */
-  private formatBattleLog(rawLog: string[]): string {
-    const lines: string[] = [];
-    let currentTurn = 0;
+  async listPokemon(query?: string, limit = 50): Promise<PokemonListItem[]> {
+    const { Dex } = await import('pokemon-showdown');
+    const q = (query || '').trim().toLowerCase();
+    const max = this.normalizeLimit(limit, 1, 200);
 
-    for (const line of rawLog) {
-      if (
-        !line ||
-        line.startsWith('|request|') ||
-        line.startsWith('|inactive|')
-      ) {
-        continue; // Skip internal messages
-      }
-
-      const parts = line.split('|').filter(Boolean);
-      if (parts.length === 0) continue;
-
-      const cmd = parts[0];
-
-      switch (cmd) {
-        case 'player':
-          lines.push(`${parts[2]} joined as ${parts[1]}!`);
-          break;
-
-        case 'teamsize':
-          break; // Skip
-
-        case 'gametype':
-          break; // Skip
-
-        case 'gen':
-          break; // Skip
-
-        case 'tier':
-          lines.push(`Format: ${parts[1]}`);
-          lines.push('---');
-          break;
-
-        case 'start':
-          lines.push('Battle started!');
-          lines.push('');
-          break;
-
-        case 'switch':
-        case 'drag': {
-          const [, pokemon] = parts;
-          const name = pokemon.split(':')[1].trim();
-          lines.push(`Go! ${name}!`);
-          break;
-        }
-
-        case 'turn': {
-          currentTurn = parseInt(parts[1]);
-          lines.push('');
-          lines.push(`=== Turn ${currentTurn} ===`);
-          break;
-        }
-
-        case 'move': {
-          const attacker = parts[1].split(':')[1].trim();
-          const move = parts[2];
-          const target = parts[3]?.split(':')[1]?.trim();
-          if (target) {
-            lines.push(`${attacker} used ${move}!`);
-          } else {
-            lines.push(`${attacker} used ${move}!`);
-          }
-          break;
-        }
-
-        case '-damage': {
-          const damagedPokemon = parts[1].split(':')[1].trim();
-          const hp = parts[2];
-          if (hp.includes('faint')) {
-            lines.push(`${damagedPokemon} fainted!`);
-          } else {
-            // Parse HP to show percentage if available
-            const hpMatch = hp.match(/(\d+)\/(\d+)/);
-            if (hpMatch) {
-              const currentHp = parseInt(hpMatch[1]);
-              const maxHp = parseInt(hpMatch[2]);
-              const percentage = ((currentHp / maxHp) * 100).toFixed(1);
-              lines.push(`(${damagedPokemon} has ${percentage}% HP remaining)`);
-            }
-          }
-          break;
-        }
-
-        case '-heal': {
-          const healedPokemon = parts[1].split(':')[1].trim();
-          lines.push(`${healedPokemon} restored HP!`);
-          break;
-        }
-
-        case '-status': {
-          const statusPokemon = parts[1].split(':')[1].trim();
-          const status = parts[2];
-          lines.push(`${statusPokemon} was ${status}!`);
-          break;
-        }
-
-        case '-boost':
-        case '-unboost': {
-          const statPokemon = parts[1].split(':')[1].trim();
-          const stat = parts[2];
-          const change = cmd === '-boost' ? 'rose' : 'fell';
-          lines.push(`${statPokemon}'s ${stat} ${change}!`);
-          break;
-        }
-
-        case '-supereffective':
-          lines.push("It's super effective!");
-          break;
-
-        case '-resisted':
-          lines.push("It's not very effective...");
-          break;
-
-        case '-crit':
-          lines.push('A critical hit!');
-          break;
-
-        case '-miss': {
-          const misser = parts[1].split(':')[1].trim();
-          lines.push(`${misser}'s attack missed!`);
-          break;
-        }
-
-        case '-fail':
-          lines.push('But it failed!');
-          break;
-
-        case '-immune': {
-          const immunePokemon = parts[1].split(':')[1].trim();
-          lines.push(`It doesn't affect ${immunePokemon}...`);
-          break;
-        }
-
-        case 'faint': {
-          const faintedPokemon = parts[1].split(':')[1].trim();
-          lines.push(`${faintedPokemon} fainted!`);
-          break;
-        }
-
-        case 'win':
-          lines.push('');
-          lines.push('---');
-          lines.push(`${parts[1]} won the battle!`);
-          break;
-
-        case 'tie':
-          lines.push('');
-          lines.push('---');
-          lines.push('The battle ended in a tie!');
-          break;
-
-        case '-weather': {
-          const weather = parts[1];
-          if (weather !== 'none') {
-            lines.push(`The weather changed to ${weather}!`);
-          }
-          break;
-        }
-
-        case '-ability': {
-          const abilityPokemon = parts[1].split(':')[1].trim();
-          const ability = parts[2];
-          lines.push(`[${abilityPokemon}'s ${ability}]`);
-          break;
-        }
-
-        case '-item': {
-          const itemPokemon = parts[1].split(':')[1].trim();
-          const item = parts[2];
-          lines.push(`${itemPokemon} has ${item}!`);
-          break;
-        }
-
-        default:
-          // Skip unknown commands
-          break;
-      }
-    }
-
-    return lines.join('\n');
+    return Dex.species
+      .all()
+      .filter((species: any) => {
+        if (!species?.exists) return false;
+        if (!species.name || species.num <= 0) return false;
+        if (species.isNonstandard && species.isNonstandard !== null) return false;
+        if (species.battleOnly) return false;
+        if (q && !species.name.toLowerCase().includes(q)) return false;
+        return true;
+      })
+      .sort((a: any, b: any) => a.name.localeCompare(b.name))
+      .slice(0, max)
+      .map((species: any) => ({
+        id: species.id,
+        name: species.name,
+        num: species.num,
+        types: species.types,
+        tier: species.tier,
+        baseSpecies: species.baseSpecies,
+        forme: species.forme || '',
+      }));
   }
 
-  /**
-   * Get available moves for a player
-   * Returns move indices 1-4 (simplified for random selection)
-   */
-  private getAvailableMoves(battle: any, playerId: string): number[] {
-    try {
-      // For now, return all 4 move slots
-      // The battle engine will handle invalid moves
-      return [1, 2, 3, 4];
-    } catch (error) {
-      console.error('Error getting moves:', error);
-      return [1, 2, 3, 4];
+  async getPokemonMoves(
+    pokemonName: string,
+    limit = 200
+  ): Promise<{ pokemon: string; moves: PokemonMoveItem[] }> {
+    const { Dex } = await import('pokemon-showdown');
+    const species = Dex.species.get(pokemonName);
+
+    if (!species.exists) {
+      throw new BadRequestException(`Pokemon \"${pokemonName}\" not found`);
     }
+
+    const learnsetData = Dex.species.getLearnsetData(species.id);
+    const learnset = learnsetData.learnset || {};
+    const max = this.normalizeLimit(limit, 1, 400);
+
+    const moves = Object.keys(learnset)
+      .map((moveId) => Dex.moves.get(moveId))
+      .filter((move: any) => move?.exists)
+      .map((move: any) => ({
+        id: move.id,
+        name: move.name,
+        type: move.type,
+        category: move.category,
+        basePower: move.basePower || 0,
+        accuracy: move.accuracy,
+        pp: move.pp,
+        priority: move.priority || 0,
+        target: move.target,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, max);
+
+    return {
+      pokemon: species.name,
+      moves,
+    };
   }
 
-  /**
-   * Get information about Pokémon (using the Dex)
-   */
   async getPokemonInfo(pokemonName: string): Promise<{
     error?: string;
     name?: string;
@@ -350,5 +216,241 @@ export class BattleService {
       weightkg: species.weightkg,
       tier: species.tier,
     };
+  }
+
+  async buildPokemonSet(input: {
+    speciesName: string;
+    selectedMoves?: string[];
+    level?: number;
+  }): Promise<BuiltPokemonSet> {
+    const { Dex } = await import('pokemon-showdown');
+    const species = Dex.species.get(input.speciesName);
+
+    if (!species.exists) {
+      throw new BadRequestException(`Pokemon \"${input.speciesName}\" not found`);
+    }
+
+    const legalMoves = await this.getPokemonMoves(species.name, 1000);
+    const legalById = new Map(legalMoves.moves.map((move) => [move.id, move.name]));
+
+    const requestedMoves = (input.selectedMoves || [])
+      .map((move) => Dex.moves.get(move))
+      .filter((move: any) => move?.exists);
+
+    const dedupRequested = Array.from(
+      new Map(requestedMoves.map((move: any) => [move.id, move])).values()
+    );
+
+    for (const move of dedupRequested) {
+      if (!legalById.has(move.id)) {
+        throw new BadRequestException(
+          `${species.name} cannot learn ${move.name} in the current Showdown dex`
+        );
+      }
+    }
+
+    const fallbackMoves = this.pickDefaultMoves(legalMoves.moves);
+    const finalMoveNames = [
+      ...dedupRequested.map((move: any) => move.name),
+      ...fallbackMoves.filter((move) => !dedupRequested.some((m: any) => m.id === move.id)).map((move) => move.name),
+    ].slice(0, 4);
+
+    if (finalMoveNames.length === 0) {
+      throw new BadRequestException(`${species.name} has no available moves`);
+    }
+
+    const abilities = species.abilities as unknown as Record<string, string>;
+    const ability = abilities['0'] || Object.values(abilities)[0] || 'None';
+    const level = input.level && Number.isFinite(input.level)
+      ? Math.max(1, Math.min(100, Math.floor(input.level)))
+      : 50;
+
+    const set = {
+      name: species.name,
+      species: species.name,
+      ability,
+      item: '',
+      moves: finalMoveNames,
+      nature: 'Hardy',
+      level,
+      gender: (species.gender || 'N') as 'M' | 'F' | 'N',
+      ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
+      evs: { hp: 84, atk: 84, def: 84, spa: 84, spd: 84, spe: 84 },
+    };
+
+    return {
+      set,
+      speciesName: species.name,
+      moves: finalMoveNames,
+    };
+  }
+
+  private pickDefaultMoves(moves: PokemonMoveItem[]): PokemonMoveItem[] {
+    const unique = Array.from(new Map(moves.map((move) => [move.id, move])).values());
+
+    const damaging = unique
+      .filter((move) => move.basePower > 0)
+      .sort((a, b) => {
+        if (b.basePower !== a.basePower) return b.basePower - a.basePower;
+        return a.name.localeCompare(b.name);
+      });
+
+    const status = unique
+      .filter((move) => move.basePower === 0)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return [...damaging, ...status].slice(0, 4);
+  }
+
+  private normalizeLimit(value: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return max;
+    return Math.max(min, Math.min(max, Math.floor(value)));
+  }
+
+  /**
+   * Format battle log into human-readable text
+   */
+  private formatBattleLog(rawLog: string[]): string {
+    const lines: string[] = [];
+    let currentTurn = 0;
+
+    for (const line of rawLog) {
+      if (
+        !line ||
+        line.startsWith('|request|') ||
+        line.startsWith('|inactive|')
+      ) {
+        continue;
+      }
+
+      const parts = line.split('|').filter(Boolean);
+      if (parts.length === 0) continue;
+
+      const cmd = parts[0];
+
+      switch (cmd) {
+        case 'player':
+          lines.push(`${parts[2]} joined as ${parts[1]}!`);
+          break;
+        case 'tier':
+          lines.push(`Format: ${parts[1]}`);
+          lines.push('---');
+          break;
+        case 'start':
+          lines.push('Battle started!');
+          lines.push('');
+          break;
+        case 'switch':
+        case 'drag': {
+          const [, pokemon] = parts;
+          const name = pokemon.split(':')[1].trim();
+          lines.push(`Go! ${name}!`);
+          break;
+        }
+        case 'turn': {
+          currentTurn = parseInt(parts[1]);
+          lines.push('');
+          lines.push(`=== Turn ${currentTurn} ===`);
+          break;
+        }
+        case 'move':
+          lines.push(`${parts[1].split(':')[1].trim()} used ${parts[2]}!`);
+          break;
+        case '-damage': {
+          const damagedPokemon = parts[1].split(':')[1].trim();
+          const hp = parts[2];
+          if (hp.includes('faint')) {
+            lines.push(`${damagedPokemon} fainted!`);
+          } else {
+            const hpMatch = hp.match(/(\d+)\/(\d+)/);
+            if (hpMatch) {
+              const currentHp = parseInt(hpMatch[1]);
+              const maxHp = parseInt(hpMatch[2]);
+              const percentage = ((currentHp / maxHp) * 100).toFixed(1);
+              lines.push(`(${damagedPokemon} has ${percentage}% HP remaining)`);
+            }
+          }
+          break;
+        }
+        case '-heal':
+          lines.push(`${parts[1].split(':')[1].trim()} restored HP!`);
+          break;
+        case '-status':
+          lines.push(`${parts[1].split(':')[1].trim()} was ${parts[2]}!`);
+          break;
+        case '-boost':
+        case '-unboost': {
+          const statPokemon = parts[1].split(':')[1].trim();
+          const stat = parts[2];
+          const change = cmd === '-boost' ? 'rose' : 'fell';
+          lines.push(`${statPokemon}'s ${stat} ${change}!`);
+          break;
+        }
+        case '-supereffective':
+          lines.push("It's super effective!");
+          break;
+        case '-resisted':
+          lines.push("It's not very effective...");
+          break;
+        case '-crit':
+          lines.push('A critical hit!');
+          break;
+        case '-miss':
+          lines.push(`${parts[1].split(':')[1].trim()}'s attack missed!`);
+          break;
+        case '-fail':
+          lines.push('But it failed!');
+          break;
+        case '-immune':
+          lines.push(`It doesn't affect ${parts[1].split(':')[1].trim()}...`);
+          break;
+        case 'faint':
+          lines.push(`${parts[1].split(':')[1].trim()} fainted!`);
+          break;
+        case 'win':
+          lines.push('');
+          lines.push('---');
+          lines.push(`${parts[1]} won the battle!`);
+          break;
+        case 'tie':
+          lines.push('');
+          lines.push('---');
+          lines.push('The battle ended in a tie!');
+          break;
+        case '-weather':
+          if (parts[1] !== 'none') {
+            lines.push(`The weather changed to ${parts[1]}!`);
+          }
+          break;
+        case '-ability':
+          lines.push(`[${parts[1].split(':')[1].trim()}'s ${parts[2]}]`);
+          break;
+        case '-item':
+          lines.push(`${parts[1].split(':')[1].trim()} has ${parts[2]}!`);
+          break;
+        default:
+          break;
+      }
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Get available move slots for a player from active request state.
+   */
+  private getAvailableMoves(battle: any, playerId: string): number[] {
+    try {
+      const sideIndex = playerId === 'p1' ? 0 : 1;
+      const active = battle?.sides?.[sideIndex]?.active?.[0];
+      const moveSlots = active?.moveSlots || [];
+
+      return moveSlots
+        .map((move: any, index: number) => ({ move, index: index + 1 }))
+        .filter(({ move }: any) => !move.disabled && move.pp > 0)
+        .map(({ index }: any) => index);
+    } catch {
+      return [1, 2, 3, 4];
+    }
   }
 }

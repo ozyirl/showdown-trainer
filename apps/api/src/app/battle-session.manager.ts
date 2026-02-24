@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import type { Battle } from 'pokemon-showdown';
+import { BattleService, StartBattleRequest } from './battle.service';
 
 export interface BattleState {
   battleId: string;
@@ -74,50 +75,36 @@ class BattleSession {
 export class BattleSessionManager {
   private sessions = new Map<string, BattleSession>();
 
-  async createBattle(): Promise<BattleState> {
+  constructor(private readonly battleService: BattleService) {}
+
+  async createBattle(config?: StartBattleRequest): Promise<BattleState> {
     const { Battle, Teams } = await import('pokemon-showdown');
 
-    // Create teams
-    const gengarSet = {
-      name: 'Gengar',
-      species: 'Gengar',
-      item: 'Life Orb',
-      ability: 'Cursed Body',
-      moves: ['Shadow Ball', 'Sludge Bomb', 'Focus Blast', 'Thunderbolt'],
-      nature: 'Timid',
-      evs: { hp: 4, spa: 252, spe: 252 },
-      ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
-      level: 50,
-      gender: 'M',
-    };
+    const p1Built = await this.battleService.buildPokemonSet({
+      speciesName: config?.p1Pokemon ?? 'Gengar',
+      selectedMoves: config?.p1Moves,
+      level: config?.level,
+    });
+    const p2Built = await this.battleService.buildPokemonSet({
+      speciesName: config?.p2Pokemon ?? 'Charizard',
+      selectedMoves: config?.p2Moves,
+      level: config?.level,
+    });
 
-    const charizardSet = {
-      name: 'Charizard',
-      species: 'Charizard',
-      item: 'Choice Specs',
-      ability: 'Blaze',
-      moves: ['Fire Blast', 'Air Slash', 'Dragon Pulse', 'Heat Wave'],
-      nature: 'Timid',
-      evs: { hp: 4, spa: 252, spe: 252 },
-      ivs: { hp: 31, atk: 31, def: 31, spa: 31, spd: 31, spe: 31 },
-      level: 50,
-      gender: 'F',
-    };
-
-    const p1Team = Teams.pack([gengarSet]);
-    const p2Team = Teams.pack([charizardSet]);
+    const p1Team = Teams.pack([p1Built.set]);
+    const p2Team = Teams.pack([p2Built.set]);
 
     const battle = new Battle({
-      formatid: 'gen9customgame',
+      formatid: config?.formatid ?? 'gen9customgame',
     });
 
     battle.setPlayer('p1', {
-      name: 'Player 1',
+      name: `Player 1 (${p1Built.speciesName})`,
       team: p1Team,
     });
 
     battle.setPlayer('p2', {
-      name: 'Player 2',
+      name: `CPU (${p2Built.speciesName})`,
       team: p2Team,
     });
 

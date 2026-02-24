@@ -1,5 +1,6 @@
-import { Controller, Get, Post, Param, Body } from '@nestjs/common';
+import { Controller, Get, Post, Param, Body, Query } from '@nestjs/common';
 import { BattleService } from './battle.service';
+import type { StartBattleRequest } from './battle.service';
 import { BattleSessionManager } from './battle-session.manager';
 
 @Controller('battle')
@@ -19,10 +20,28 @@ export class BattleController {
     return this.battleService.getPokemonInfo(name);
   }
 
+  @Get('pokemon')
+  async listPokemon(
+    @Query('q') q?: string,
+    @Query('limit') limit?: string
+  ) {
+    const parsedLimit = limit ? Number(limit) : 50;
+    return this.battleService.listPokemon(q, parsedLimit);
+  }
+
+  @Get('pokemon/:name/moves')
+  async getPokemonMoves(
+    @Param('name') name: string,
+    @Query('limit') limit?: string
+  ) {
+    const parsedLimit = limit ? Number(limit) : 200;
+    return this.battleService.getPokemonMoves(name, parsedLimit);
+  }
+
   // Interactive battle endpoints
   @Post('start')
-  async startBattle() {
-    return this.battleSessionManager.createBattle();
+  async startBattle(@Body() body?: StartBattleRequest) {
+    return this.battleSessionManager.createBattle(body);
   }
 
   @Post(':id/move')
