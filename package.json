@@ -50,9 +50,11 @@
     "libs/*"
   ],
   "dependencies": {
+    "@ai-sdk/openai": "^3.0.31",
     "@nestjs/common": "^11.0.0",
     "@nestjs/core": "^11.0.0",
     "@nestjs/platform-express": "^11.0.0",
+    "ai": "^6.0.97",
     "axios": "^1.6.0",
     "pokemon-showdown": "^0.11.10",
     "reflect-metadata": "^0.1.13",

@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import type { Battle } from 'pokemon-showdown';
 import { BattleService, StartBattleRequest } from './battle.service';
+import { CpuMoveAiService } from './cpu-move-ai.service';
 
 export interface BattleState {
   battleId: string;
@@ -8,12 +9,14 @@ export interface BattleState {
     name: string;
     hp: number;
     maxHp: number;
+    hpPercent: number;
     status: string | null;
   };
   p2Pokemon: {
     name: string;
     hp: number;
     maxHp: number;
+    hpPercent: number;
     status: string | null;
   };
   availableMoves: {
@@ -36,6 +39,27 @@ export interface BattleState {
     moveName: string | null;
     acceptedAt: number;
   } | null;
+  lastTurnEvents: BattleTurnEvent[];
+}
+
+export interface BattleTurnEvent {
+  kind:
+    | 'turn'
+    | 'move'
+    | 'damage'
+    | 'heal'
+    | 'status'
+    | 'effectiveness'
+    | 'crit'
+    | 'miss'
+    | 'faint'
+    | 'win';
+  text: string;
+  actor?: string;
+  target?: string;
+  moveName?: string;
+  hpPercent?: number;
+  status?: string | null;
 }
 
 class BattleSession {
@@ -47,6 +71,7 @@ class BattleSession {
   currentTurn = 0;
   lastLogIndex = 0; // Track which logs we've already processed
   lastAction: BattleState['lastAction'] = null;
+  lastTurnEvents: BattleTurnEvent[] = [];
 
   constructor(id: string, battle: Battle) {
     this.id = id;
@@ -75,7 +100,10 @@ class BattleSession {
 export class BattleSessionManager {
   private sessions = new Map<string, BattleSession>();
 
-  constructor(private readonly battleService: BattleService) {}
+  constructor(
+    private readonly battleService: BattleService,
+    private readonly cpuMoveAiService: CpuMoveAiService
+  ) {}
 
   async createBattle(config?: StartBattleRequest): Promise<BattleState> {
     const { Battle, Teams } = await import('pokemon-showdown');
@@ -156,6 +184,10 @@ export class BattleSessionManager {
       acceptedAt: Date.now(),
     };
 
+    if (player === 'p1' && this.isCpuAiEnabled() && !session.hasP2Chosen()) {
+      await this.tryChooseCpuMove(session);
+    }
+
     // If both players have chosen, process the turn
     if (session.bothPlayersChosen()) {
       return await this.processTurn(battleId);
@@ -205,6 +237,7 @@ export class BattleSessionManager {
     // Capture NEW logs since last turn
     const newLogs = battle.log.slice(session.lastLogIndex);
     const formattedNewLogs = this.formatRecentLog(newLogs);
+    session.lastTurnEvents = this.buildTurnEvents(newLogs);
 
     // Append new logs to the session's turn log
     session.turnLog.push(...formattedNewLogs);
@@ -237,8 +270,11 @@ export class BattleSessionManager {
 
     // Get available moves for p1
     const availableMoves =
-      p1Active?.moveSlots?.map((move: any) => {
-        const dexMove = (battle as any)?.dex?.moves?.get?.(move.id || move.move);
+      p1Active?.moveSlots?.map((move: { id?: string; move: string; pp: number; maxpp: number }) => {
+        const battleWithDex = battle as unknown as {
+          dex?: { moves?: { get?: (idOrName: string) => { type?: string; basePower?: number } | undefined } };
+        };
+        const dexMove = battleWithDex.dex?.moves?.get?.(move.id || move.move);
         return {
           name: move.move,
           type: dexMove?.type || 'Normal',
@@ -267,12 +303,14 @@ export class BattleSessionManager {
         name: p1Active?.name || 'Unknown',
         hp: p1Active?.hp || 0,
         maxHp: p1Active?.maxhp || 100,
+        hpPercent: this.toHpPercent(p1Active?.hp, p1Active?.maxhp),
         status: p1Active?.status || null,
       },
       p2Pokemon: {
         name: p2Active?.name || 'Unknown',
         hp: p2Active?.hp || 0,
         maxHp: p2Active?.maxhp || 100,
+        hpPercent: this.toHpPercent(p2Active?.hp, p2Active?.maxhp),
         status: p2Active?.status || null,
       },
       availableMoves,
@@ -284,6 +322,7 @@ export class BattleSessionManager {
       pendingPlayers,
       phase,
       lastAction: session.lastAction,
+      lastTurnEvents: session.lastTurnEvents,
     };
   }
 
@@ -388,5 +427,207 @@ export class BattleSessionManager {
 
   deleteBattle(battleId: string) {
     this.sessions.delete(battleId);
+  }
+
+  private toHpPercent(hp?: number, maxHp?: number): number {
+    if (!maxHp || maxHp <= 0 || typeof hp !== 'number') return 0;
+    return Math.max(0, Math.min(100, Math.round((hp / maxHp) * 100)));
+  }
+
+  private buildTurnEvents(logs: string[]): BattleTurnEvent[] {
+    const events: BattleTurnEvent[] = [];
+
+    for (const line of logs) {
+      if (!line || line.startsWith('|request|')) continue;
+      const parts = line.split('|').filter(Boolean);
+      if (parts.length === 0) continue;
+
+      const cmd = parts[0];
+      switch (cmd) {
+        case 'turn':
+          events.push({
+            kind: 'turn',
+            text: `Turn ${parts[1]}`,
+          });
+          break;
+        case 'move': {
+          const actor = parts[1]?.split(':')[1]?.trim();
+          const moveName = parts[2];
+          events.push({
+            kind: 'move',
+            text: `${actor} used ${moveName}!`,
+            actor,
+            moveName,
+            target: parts[3]?.split(':')[1]?.trim(),
+          });
+          break;
+        }
+        case '-damage': {
+          const target = parts[1]?.split(':')[1]?.trim();
+          const hpState = parts[2] || '';
+          const parsed = this.parseHpProtocolPercent(hpState);
+          events.push({
+            kind: 'damage',
+            text: parsed.fainted ? `${target} fainted!` : `${target} HP ${parsed.hpPercent}%`,
+            target,
+            hpPercent: parsed.hpPercent ?? undefined,
+            status: parsed.status,
+          });
+          break;
+        }
+        case '-heal': {
+          const target = parts[1]?.split(':')[1]?.trim();
+          const parsed = this.parseHpProtocolPercent(parts[2] || '');
+          events.push({
+            kind: 'heal',
+            text: parsed.hpPercent !== null ? `${target} healed to ${parsed.hpPercent}%` : `${target} healed!`,
+            target,
+            hpPercent: parsed.hpPercent ?? undefined,
+            status: parsed.status,
+          });
+          break;
+        }
+        case '-status': {
+          const target = parts[1]?.split(':')[1]?.trim();
+          const status = parts[2] || null;
+          events.push({
+            kind: 'status',
+            text: `${target} was ${status}!`,
+            target,
+            status,
+          });
+          break;
+        }
+        case '-supereffective':
+          events.push({ kind: 'effectiveness', text: "It's super effective!" });
+          break;
+        case '-resisted':
+          events.push({ kind: 'effectiveness', text: "It's not very effective..." });
+          break;
+        case '-crit':
+          events.push({ kind: 'crit', text: 'Critical hit!' });
+          break;
+        case '-miss':
+          events.push({
+            kind: 'miss',
+            text: `${parts[1]?.split(':')[1]?.trim()}'s attack missed!`,
+            actor: parts[1]?.split(':')[1]?.trim(),
+          });
+          break;
+        case 'faint': {
+          const target = parts[1]?.split(':')[1]?.trim();
+          events.push({ kind: 'faint', text: `${target} fainted!`, target, hpPercent: 0 });
+          break;
+        }
+        case 'win':
+          events.push({ kind: 'win', text: `${parts[1]} won the battle!`, actor: parts[1] });
+          break;
+      }
+    }
+
+    return this.compactTurnEvents(events);
+  }
+
+  private compactTurnEvents(events: BattleTurnEvent[]): BattleTurnEvent[] {
+    const compacted: BattleTurnEvent[] = [];
+    for (const event of events) {
+      const prev = compacted[compacted.length - 1];
+      if (
+        prev &&
+        prev.kind === 'damage' &&
+        event.kind === 'damage' &&
+        prev.target === event.target &&
+        prev.hpPercent === event.hpPercent &&
+        prev.status === event.status
+      ) {
+        continue;
+      }
+      compacted.push(event);
+    }
+    return compacted;
+  }
+
+  private parseHpProtocolPercent(hpState: string): {
+    hpPercent: number | null;
+    status: string | null;
+    fainted: boolean;
+  } {
+    if (!hpState) return { hpPercent: null, status: null, fainted: false };
+    if (hpState.includes('fnt')) {
+      return { hpPercent: 0, status: null, fainted: true };
+    }
+
+    const fractionMatch = hpState.match(/(\d+)\/(\d+)/);
+    const statusMatch = hpState.match(/\b(brn|psn|tox|par|slp|frz)\b/);
+    if (!fractionMatch) {
+      return { hpPercent: null, status: statusMatch?.[1] ?? null, fainted: false };
+    }
+
+    const current = Number(fractionMatch[1]);
+    const max = Number(fractionMatch[2]);
+    return {
+      hpPercent: max > 0 ? Math.max(0, Math.min(100, Math.round((current / max) * 100))) : null,
+      status: statusMatch?.[1] ?? null,
+      fainted: false,
+    };
+  }
+
+  private isCpuAiEnabled(): boolean {
+    return process.env.ENABLE_CPU_AI === 'true';
+  }
+
+  private async tryChooseCpuMove(session: BattleSession): Promise<void> {
+    const battle = session.battle as unknown as {
+      sides?: Array<{
+        requestState?: string;
+        active?: Array<{ name?: string; moveSlots?: Array<{ id?: string; move: string; pp: number; disabled?: boolean }> }>;
+      }>;
+      dex?: { moves?: { get?: (idOrName: string) => { type?: string; basePower?: number } | undefined } };
+    };
+
+    const p2Side = battle.sides?.[1];
+    const p1Side = battle.sides?.[0];
+    if (p2Side?.requestState !== 'move') return;
+
+    const p2MoveChoices =
+      p2Side.active?.[0]?.moveSlots
+        ?.map((slot, index) => {
+          const dexMove = battle.dex?.moves?.get?.(slot.id || slot.move);
+          return {
+            index: index + 1,
+            name: slot.move,
+            type: dexMove?.type,
+            power:
+              typeof dexMove?.basePower === 'number' && dexMove.basePower > 0
+                ? dexMove.basePower
+                : null,
+            pp: slot.pp,
+            disabled: !!slot.disabled,
+          };
+        })
+        .filter((move) => !move.disabled && move.pp > 0)
+        .map(({ disabled, ...move }) => {
+          void disabled;
+          return move;
+        }) ?? [];
+
+    if (p2MoveChoices.length === 0) return;
+
+    try {
+      const decision = await this.cpuMoveAiService.chooseCpuMove({
+        battleId: session.id,
+        turn: session.currentTurn + 1,
+        cpuPokemonName: p2Side.active?.[0]?.name || 'Unknown',
+        playerPokemonName: p1Side?.active?.[0]?.name || 'Unknown',
+        availableMoves: p2MoveChoices,
+        recentLog: session.turnLog.slice(-8),
+      });
+
+      const selected = p2MoveChoices.find((move) => move.index === decision.moveIndex);
+      session.p2MoveChoice = `move ${selected?.index ?? p2MoveChoices[0].index}`;
+    } catch {
+      // Scaffold fallback keeps gameplay working if AI SDK packages are not installed yet.
+      session.p2MoveChoice = `move ${p2MoveChoices[0].index}`;
+    }
   }
 }

@@ -39,9 +39,69 @@ export interface StartBattleRequest {
 }
 
 interface BuiltPokemonSet {
-  set: any;
+  set: PokemonSetLike;
   speciesName: string;
   moves: string[];
+}
+
+interface PokemonSetLike {
+  name: string;
+  species: string;
+  ability: string;
+  item: string;
+  moves: string[];
+  nature: string;
+  level: number;
+  gender: 'M' | 'F' | 'N';
+  ivs: Record<string, number>;
+  evs: Record<string, number>;
+}
+
+interface DexSpeciesLike {
+  id: string;
+  name: string;
+  num: number;
+  exists: boolean;
+  types: string[];
+  tier?: string;
+  baseSpecies: string;
+  forme?: string;
+  battleOnly?: string | string[];
+  isNonstandard?: string | null;
+  baseStats: { hp: number; atk: number; def: number; spa: number; spd: number; spe: number };
+  abilities: unknown;
+  weightkg?: number;
+  gender?: 'M' | 'F' | 'N';
+}
+
+interface DexMoveLike {
+  id: string;
+  name: string;
+  exists: boolean;
+  type: string;
+  category: string;
+  basePower: number;
+  accuracy: number | true;
+  pp: number;
+  priority?: number;
+  target: string;
+}
+
+interface BattleMoveSlotLike {
+  disabled?: boolean | string;
+  pp: number;
+}
+
+interface BattleActiveLike {
+  moveSlots?: BattleMoveSlotLike[];
+}
+
+interface BattleSideLike {
+  active?: BattleActiveLike[];
+}
+
+interface BattleLike {
+  sides?: BattleSideLike[];
 }
 
 @Injectable()
@@ -122,7 +182,7 @@ export class BattleService {
 
     return Dex.species
       .all()
-      .filter((species: any) => {
+      .filter((species: DexSpeciesLike) => {
         if (!species?.exists) return false;
         if (!species.name || species.num <= 0) return false;
         if (species.isNonstandard && species.isNonstandard !== null) return false;
@@ -130,9 +190,9 @@ export class BattleService {
         if (q && !species.name.toLowerCase().includes(q)) return false;
         return true;
       })
-      .sort((a: any, b: any) => a.name.localeCompare(b.name))
+      .sort((a: DexSpeciesLike, b: DexSpeciesLike) => a.name.localeCompare(b.name))
       .slice(0, max)
-      .map((species: any) => ({
+      .map((species: DexSpeciesLike) => ({
         id: species.id,
         name: species.name,
         num: species.num,
@@ -151,7 +211,7 @@ export class BattleService {
     const species = Dex.species.get(pokemonName);
 
     if (!species.exists) {
-      throw new BadRequestException(`Pokemon \"${pokemonName}\" not found`);
+      throw new BadRequestException(`Pokemon "${pokemonName}" not found`);
     }
 
     const learnsetData = Dex.species.getLearnsetData(species.id);
@@ -160,8 +220,8 @@ export class BattleService {
 
     const moves = Object.keys(learnset)
       .map((moveId) => Dex.moves.get(moveId))
-      .filter((move: any) => move?.exists)
-      .map((move: any) => ({
+      .filter((move: DexMoveLike) => move?.exists)
+      .map((move: DexMoveLike) => ({
         id: move.id,
         name: move.name,
         type: move.type,
@@ -233,7 +293,7 @@ export class BattleService {
     const species = Dex.species.get(input.speciesName);
 
     if (!species.exists) {
-      throw new BadRequestException(`Pokemon \"${input.speciesName}\" not found`);
+      throw new BadRequestException(`Pokemon "${input.speciesName}" not found`);
     }
 
     const legalMoves = await this.getPokemonMoves(species.name, 1000);
@@ -241,10 +301,10 @@ export class BattleService {
 
     const requestedMoves = (input.selectedMoves || [])
       .map((move) => Dex.moves.get(move))
-      .filter((move: any) => move?.exists);
+      .filter((move: DexMoveLike) => move?.exists);
 
     const dedupRequested = Array.from(
-      new Map(requestedMoves.map((move: any) => [move.id, move])).values()
+      new Map(requestedMoves.map((move: DexMoveLike) => [move.id, move])).values()
     );
 
     for (const move of dedupRequested) {
@@ -260,8 +320,10 @@ export class BattleService {
       baseStats: species.baseStats,
     });
     const finalMoveNames = [
-      ...dedupRequested.map((move: any) => move.name),
-      ...fallbackMoves.filter((move) => !dedupRequested.some((m: any) => m.id === move.id)).map((move) => move.name),
+      ...dedupRequested.map((move: DexMoveLike) => move.name),
+      ...fallbackMoves
+        .filter((move) => !dedupRequested.some((m: DexMoveLike) => m.id === move.id))
+        .map((move) => move.name),
     ].slice(0, 4);
 
     if (finalMoveNames.length === 0) {
@@ -548,16 +610,16 @@ export class BattleService {
   /**
    * Get available move slots for a player from active request state.
    */
-  private getAvailableMoves(battle: any, playerId: string): number[] {
+  private getAvailableMoves(battle: BattleLike, playerId: string): number[] {
     try {
       const sideIndex = playerId === 'p1' ? 0 : 1;
       const active = battle?.sides?.[sideIndex]?.active?.[0];
       const moveSlots = active?.moveSlots || [];
 
       return moveSlots
-        .map((move: any, index: number) => ({ move, index: index + 1 }))
-        .filter(({ move }: any) => !move.disabled && move.pp > 0)
-        .map(({ index }: any) => index);
+        .map((move: BattleMoveSlotLike, index: number) => ({ move, index: index + 1 }))
+        .filter(({ move }) => !move.disabled && move.pp > 0)
+        .map(({ index }) => index);
     } catch {
       return [1, 2, 3, 4];
     }
