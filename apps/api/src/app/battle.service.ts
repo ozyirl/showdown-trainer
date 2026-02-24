@@ -146,7 +146,7 @@ export class BattleService {
   async getPokemonMoves(
     pokemonName: string,
     limit = 200
-  ): Promise<{ pokemon: string; moves: PokemonMoveItem[] }> {
+  ): Promise<{ pokemon: string; moves: PokemonMoveItem[]; recommendedMoves: string[] }> {
     const { Dex } = await import('pokemon-showdown');
     const species = Dex.species.get(pokemonName);
 
@@ -175,9 +175,15 @@ export class BattleService {
       .sort((a, b) => a.name.localeCompare(b.name))
       .slice(0, max);
 
+    const recommendedMoves = this.pickRecommendedMoves(moves, {
+      types: species.types,
+      baseStats: species.baseStats,
+    }).map((move) => move.name);
+
     return {
       pokemon: species.name,
       moves,
+      recommendedMoves,
     };
   }
 
@@ -249,7 +255,10 @@ export class BattleService {
       }
     }
 
-    const fallbackMoves = this.pickDefaultMoves(legalMoves.moves);
+    const fallbackMoves = this.pickRecommendedMoves(legalMoves.moves, {
+      types: species.types,
+      baseStats: species.baseStats,
+    });
     const finalMoveNames = [
       ...dedupRequested.map((move: any) => move.name),
       ...fallbackMoves.filter((move) => !dedupRequested.some((m: any) => m.id === move.id)).map((move) => move.name),
@@ -285,21 +294,121 @@ export class BattleService {
     };
   }
 
-  private pickDefaultMoves(moves: PokemonMoveItem[]): PokemonMoveItem[] {
+  private pickRecommendedMoves(
+    moves: PokemonMoveItem[],
+    context: {
+      types: string[];
+      baseStats?: { atk: number; spa: number };
+    }
+  ): PokemonMoveItem[] {
     const unique = Array.from(new Map(moves.map((move) => [move.id, move])).values());
+    const typeSet = new Set(context.types || []);
+    const atk = context.baseStats?.atk ?? 80;
+    const spa = context.baseStats?.spa ?? 80;
+    const preferredCategory = atk >= spa ? 'Physical' : 'Special';
 
-    const damaging = unique
-      .filter((move) => move.basePower > 0)
-      .sort((a, b) => {
-        if (b.basePower !== a.basePower) return b.basePower - a.basePower;
-        return a.name.localeCompare(b.name);
-      });
+    const scored = unique
+      .map((move) => ({
+        move,
+        score: this.scoreMove(move, { typeSet, preferredCategory }),
+      }))
+      .sort((a, b) => b.score - a.score || a.move.name.localeCompare(b.move.name));
 
-    const status = unique
-      .filter((move) => move.basePower === 0)
-      .sort((a, b) => a.name.localeCompare(b.name));
+    const chosen: PokemonMoveItem[] = [];
+    const usedIds = new Set<string>();
 
-    return [...damaging, ...status].slice(0, 4);
+    const pick = (predicate: (move: PokemonMoveItem) => boolean) => {
+      const found = scored.find(({ move }) => !usedIds.has(move.id) && predicate(move));
+      if (!found) return;
+      usedIds.add(found.move.id);
+      chosen.push(found.move);
+    };
+
+    // Prefer one strong STAB move in the preferred attacking category
+    pick((move) =>
+      move.basePower > 0 &&
+      move.category === preferredCategory &&
+      typeSet.has(move.type)
+    );
+
+    // Add coverage move of a different type
+    pick((move) =>
+      move.basePower > 0 &&
+      (!chosen[0] || move.type !== chosen[0].type)
+    );
+
+    // Add best setup/status/support move if available
+    pick((move) => move.basePower === 0 && this.isUsefulStatusMove(move));
+
+    // Fill remaining slots with best overall moves, avoiding too much duplicate type spam
+    while (chosen.length < 4) {
+      const currentTypes = new Set(chosen.map((m) => m.type));
+      const found =
+        scored.find(({ move }) =>
+          !usedIds.has(move.id) &&
+          (move.basePower === 0 || !currentTypes.has(move.type))
+        ) ||
+        scored.find(({ move }) => !usedIds.has(move.id));
+
+      if (!found) break;
+      usedIds.add(found.move.id);
+      chosen.push(found.move);
+    }
+
+    return chosen.slice(0, 4);
+  }
+
+  private scoreMove(
+    move: PokemonMoveItem,
+    context: { typeSet: Set<string>; preferredCategory: string }
+  ): number {
+    const isDamaging = move.basePower > 0;
+    const accuracy =
+      move.accuracy === true ? 100 : typeof move.accuracy === 'number' ? move.accuracy : 100;
+    const stabBonus = context.typeSet.has(move.type) ? 20 : 0;
+    const categoryBonus = move.category === context.preferredCategory ? 10 : 0;
+    const priorityBonus = Math.max(0, move.priority) * 8;
+    const accuracyFactor = Math.max(0.55, accuracy / 100);
+
+    if (isDamaging) {
+      return (
+        move.basePower * accuracyFactor +
+        stabBonus +
+        categoryBonus +
+        priorityBonus +
+        Math.min(move.pp, 16) * 0.2
+      );
+    }
+
+    return this.isUsefulStatusMove(move) ? 35 + stabBonus + priorityBonus : 5;
+  }
+
+  private isUsefulStatusMove(move: PokemonMoveItem): boolean {
+    const id = move.id;
+    return [
+      'protect',
+      'substitute',
+      'recover',
+      'roost',
+      'slackoff',
+      'softboiled',
+      'swordsdance',
+      'nastyplot',
+      'calmmind',
+      'dragondance',
+      'bulkup',
+      'agility',
+      'thunderwave',
+      'toxic',
+      'willowisp',
+      'stealthrock',
+      'spikes',
+      'rapidspin',
+      'defog',
+      'taunt',
+      'encore',
+      'leechseed',
+    ].includes(id);
   }
 
   private normalizeLimit(value: number, min: number, max: number): number {

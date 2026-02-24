@@ -237,13 +237,18 @@ export class BattleSessionManager {
 
     // Get available moves for p1
     const availableMoves =
-      p1Active?.moveSlots?.map((move: any) => ({
-        name: move.move,
-        type: move.type || 'Normal',
-        power: move.basePower || null,
-        pp: move.pp,
-        maxPp: move.maxpp,
-      })) || [];
+      p1Active?.moveSlots?.map((move: any) => {
+        const dexMove = (battle as any)?.dex?.moves?.get?.(move.id || move.move);
+        return {
+          name: move.move,
+          type: dexMove?.type || 'Normal',
+          power: typeof dexMove?.basePower === 'number' && dexMove.basePower > 0
+            ? dexMove.basePower
+            : null,
+          pp: move.pp,
+          maxPp: move.maxpp,
+        };
+      }) || [];
 
     // Return accumulated turn logs from the session
     const pendingPlayers: ('p1' | 'p2')[] = [];
