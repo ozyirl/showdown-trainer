@@ -6,10 +6,16 @@ import { BattleService } from './battle.service';
 import { BattleSessionManager } from './battle-session.manager';
 import { OrgCommonModule } from '@org/common';
 import { BattleEngineModule } from '@org/battle-engine';
+import { CpuMoveAiService } from './cpu-move-ai.service';
 
 @Module({
   imports: [OrgCommonModule, BattleEngineModule],
   controllers: [AppController, BattleController],
-  providers: [AppService, BattleService, BattleSessionManager],
+  providers: [
+    AppService,
+    BattleService,
+    BattleSessionManager,
+    CpuMoveAiService,
+  ],
 })
 export class AppModule {}
