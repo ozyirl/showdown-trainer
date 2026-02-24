@@ -38,6 +38,46 @@ export interface StartBattleRequest {
   formatid?: string;
 }
 
+export interface ShowdownRequestMoveOption {
+  move: string;
+  id?: string;
+  pp?: number;
+  disabled?: boolean | string;
+}
+
+export interface ShowdownRequestActive {
+  moves?: ShowdownRequestMoveOption[];
+}
+
+export interface ShowdownRequestSidePokemon {
+  ident?: string;
+  active?: boolean;
+  condition?: string;
+  fainted?: boolean;
+}
+
+export interface ShowdownRequest {
+  wait?: boolean;
+  teamPreview?: boolean;
+  forceSwitch?: boolean[];
+  active?: ShowdownRequestActive[];
+  side?: {
+    pokemon?: ShowdownRequestSidePokemon[];
+  };
+}
+
+export interface ShowdownRequestsBySide {
+  p1: ShowdownRequest;
+  p2: ShowdownRequest;
+}
+
+export interface BattleStepResult {
+  rawLogDelta: string[];
+  requests: ShowdownRequestsBySide;
+  ended: boolean;
+  winner?: string;
+}
+
 interface BuiltPokemonSet {
   set: PokemonSetLike;
   speciesName: string;
@@ -104,8 +144,78 @@ interface BattleLike {
   sides?: BattleSideLike[];
 }
 
+interface TurnStepSession {
+  battle: {
+    choose: (side: 'p1' | 'p2', choice: string) => unknown;
+    log: string[];
+    ended?: boolean;
+    winner?: string;
+    sides?: Array<{
+      activeRequest?: ShowdownRequest | null;
+    }>;
+  };
+  lastLogIndex: number;
+}
+
 @Injectable()
 export class BattleService {
+  private readonly turnStepSessions = new Map<string, TurnStepSession>();
+
+  registerBattleSession(
+    battleId: string,
+    battle: TurnStepSession['battle'],
+    lastLogIndex = 0
+  ): void {
+    this.turnStepSessions.set(battleId, {
+      battle,
+      lastLogIndex,
+    });
+  }
+
+  unregisterBattleSession(battleId: string): void {
+    this.turnStepSessions.delete(battleId);
+  }
+
+  getRequests(battleId: string): ShowdownRequestsBySide {
+    const session = this.turnStepSessions.get(battleId);
+    if (!session) {
+      throw new BadRequestException(`Battle "${battleId}" not found`);
+    }
+
+    const p1 = this.cloneRequest(session.battle.sides?.[0]?.activeRequest);
+    const p2 = this.cloneRequest(session.battle.sides?.[1]?.activeRequest);
+    return { p1, p2 };
+  }
+
+  step(
+    battleId: string,
+    p1Choice: string,
+    p2Choice: string
+  ): BattleStepResult {
+    const session = this.turnStepSessions.get(battleId);
+    if (!session) {
+      throw new BadRequestException(`Battle "${battleId}" not found`);
+    }
+
+    const requests = this.getRequests(battleId);
+    const resolvedP1Choice = this.resolveChoiceForRequest(requests.p1, p1Choice);
+    const resolvedP2Choice = this.resolveChoiceForRequest(requests.p2, p2Choice);
+
+    // Submit both choices for the same turn. Showdown resolves order internally.
+    session.battle.choose('p1', resolvedP1Choice);
+    session.battle.choose('p2', resolvedP2Choice);
+
+    const rawLogDelta = session.battle.log.slice(session.lastLogIndex);
+    session.lastLogIndex = session.battle.log.length;
+
+    return {
+      rawLogDelta,
+      requests: this.getRequests(battleId),
+      ended: !!session.battle.ended,
+      winner: session.battle.winner || undefined,
+    };
+  }
+
   /**
    * Simulates a 1v1 battle between two selectable Pokemon (defaults to Gengar vs Charizard)
    */
@@ -476,6 +586,76 @@ export class BattleService {
   private normalizeLimit(value: number, min: number, max: number): number {
     if (!Number.isFinite(value)) return max;
     return Math.max(min, Math.min(max, Math.floor(value)));
+  }
+
+  private cloneRequest(request?: ShowdownRequest | null): ShowdownRequest {
+    if (!request) return {};
+    return JSON.parse(JSON.stringify(request)) as ShowdownRequest;
+  }
+
+  private resolveChoiceForRequest(request: ShowdownRequest, requestedChoice: string): string {
+    if (request.wait) return 'default';
+
+    if (request.teamPreview) {
+      const normalized = requestedChoice?.trim() || 'team 1';
+      return /^team\s+\d+$/i.test(normalized) ? normalized : 'team 1';
+    }
+
+    if (request.forceSwitch?.[0]) {
+      const legalSwitches = this.getLegalSwitchChoices(request);
+      if (legalSwitches.length === 0) {
+        return 'default';
+      }
+
+      const normalized = requestedChoice?.trim();
+      if (normalized && legalSwitches.includes(normalized)) {
+        return normalized;
+      }
+      if (normalized && normalized !== 'default') {
+        throw new BadRequestException(
+          `Invalid forced switch choice "${normalized}". Legal choices: ${legalSwitches.join(', ')}`
+        );
+      }
+      return legalSwitches[0];
+    }
+
+    const legalMoves = this.getLegalMoveChoices(request);
+    if (legalMoves.length > 0) {
+      const normalized = requestedChoice?.trim();
+      if (normalized && legalMoves.includes(normalized)) {
+        return normalized;
+      }
+      if (normalized && normalized !== 'default') {
+        throw new BadRequestException(
+          `Invalid move choice "${normalized}". Legal choices: ${legalMoves.join(', ')}`
+        );
+      }
+      return legalMoves[0];
+    }
+
+    return 'default';
+  }
+
+  private getLegalMoveChoices(request: ShowdownRequest): string[] {
+    const moves = request.active?.[0]?.moves ?? [];
+    return moves
+      .map((move, index) => ({ move, index: index + 1 }))
+      .filter(({ move }) => !move.disabled && (move.pp ?? 1) > 0)
+      .map(({ index }) => `move ${index}`);
+  }
+
+  private getLegalSwitchChoices(request: ShowdownRequest): string[] {
+    const party = request.side?.pokemon ?? [];
+    return party
+      .map((pokemon, index) => ({ pokemon, index: index + 1 }))
+      .filter(({ pokemon }) => !pokemon.active)
+      .filter(({ pokemon }) => !this.isFainted(pokemon))
+      .map(({ index }) => `switch ${index}`);
+  }
+
+  private isFainted(pokemon: ShowdownRequestSidePokemon): boolean {
+    if (pokemon.fainted) return true;
+    return typeof pokemon.condition === 'string' && pokemon.condition.includes('fnt');
   }
 
   /**
