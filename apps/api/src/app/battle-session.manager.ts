@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import type { Battle } from 'pokemon-showdown';
 
 export interface BattleState {
@@ -27,6 +27,14 @@ export interface BattleState {
   winner: string | null;
   currentTurn: number;
   waitingForMove: boolean;
+  pendingPlayers: ('p1' | 'p2')[];
+  phase: 'awaiting-moves' | 'resolving' | 'ended';
+  lastAction: {
+    player: 'p1' | 'p2';
+    moveIndex: number;
+    moveName: string | null;
+    acceptedAt: number;
+  } | null;
 }
 
 class BattleSession {
@@ -37,6 +45,7 @@ class BattleSession {
   turnLog: string[] = [];
   currentTurn = 0;
   lastLogIndex = 0; // Track which logs we've already processed
+  lastAction: BattleState['lastAction'] = null;
 
   constructor(id: string, battle: Battle) {
     this.id = id;
@@ -136,76 +145,52 @@ export class BattleSessionManager {
   ): Promise<BattleState> {
     const session = this.sessions.get(battleId);
     if (!session) {
-      throw new Error('Battle not found');
+      throw new NotFoundException('Battle not found');
     }
-
-    console.log(`\n=== submitMove called ===`);
-    console.log(`Battle ID: ${battleId}`);
-    console.log(`Player: ${player}, Move Index: ${moveIndex}`);
-    console.log(`Current Turn: ${session.currentTurn}`);
-    console.log(`Battle Ended: ${session.battle.ended}`);
-    console.log(
-      `P1 Choice: ${session.p1MoveChoice}, P2 Choice: ${session.p2MoveChoice}`
-    );
 
     if (session.battle.ended) {
-      console.log('Battle already ended, throwing error');
-      throw new Error('Battle already ended');
+      throw new BadRequestException('Battle already ended');
     }
 
-    const moveChoice = `move ${moveIndex}`;
+    const normalizedMoveIndex = this.normalizeMoveIndex(session, player, moveIndex);
+    const moveChoice = `move ${normalizedMoveIndex}`;
+    const moveName = this.getMoveName(session, player, normalizedMoveIndex);
 
     if (player === 'p1') {
       session.p1MoveChoice = moveChoice;
-      console.log(`Set P1 move choice: ${moveChoice}`);
     } else {
       session.p2MoveChoice = moveChoice;
-      console.log(`Set P2 move choice: ${moveChoice}`);
     }
 
-    console.log(`Both players chosen? ${session.bothPlayersChosen()}`);
+    session.lastAction = {
+      player,
+      moveIndex: normalizedMoveIndex,
+      moveName,
+      acceptedAt: Date.now(),
+    };
 
     // If both players have chosen, process the turn
     if (session.bothPlayersChosen()) {
-      console.log('Both players have chosen, processing turn...');
       return await this.processTurn(battleId);
     }
 
-    console.log('Waiting for other player, returning current state');
     return this.getBattleState(battleId);
   }
 
   private async processTurn(battleId: string): Promise<BattleState> {
     const session = this.sessions.get(battleId);
     if (!session) {
-      throw new Error('Battle not found');
+      throw new NotFoundException('Battle not found');
     }
 
     const { battle } = session;
 
-    // Log the turn number for debugging
-    console.log(`\n=== Processing turn ${session.currentTurn + 1} ===`);
-    console.log(
-      `P1 Move: ${session.p1MoveChoice}, P2 Move: ${session.p2MoveChoice}`
-    );
-    console.log(`Battle log length before: ${battle.log.length}`);
-    console.log(`Last processed log index: ${session.lastLogIndex}`);
-    console.log(`Battle ended before turn: ${battle.ended}`);
-
-    // Check if battle is ready for moves BEFORE we submit
-    console.log(
-      `P1 has active request BEFORE: ${!!battle.sides[0]?.activeRequest}`
-    );
-    console.log(
-      `P2 has active request BEFORE: ${!!battle.sides[1]?.activeRequest}`
-    );
-
     const p1RequestState = battle.sides[0]?.requestState;
     const p2RequestState = battle.sides[1]?.requestState;
     if (p1RequestState !== 'move' || p2RequestState !== 'move') {
-      console.log(
-        `Battle not ready for moves (p1: ${p1RequestState}, p2: ${p2RequestState})`
-      );
+      // Clear stale queued choices so the next click does not accidentally
+      // resolve a previous turn.
+      session.clearChoices();
       return this.getBattleState(battleId);
     }
 
@@ -214,50 +199,20 @@ export class BattleSessionManager {
       const p1Choice = session.p1MoveChoice;
       const p2Choice = session.p2MoveChoice;
       if (!p1Choice || !p2Choice) {
-        throw new Error('Missing choices for one or both players');
+        throw new BadRequestException('Missing choices for one or both players');
       }
 
       battle.makeChoices(p1Choice, p2Choice);
-
-      // Log battle state after choices
-      console.log(
-        `P1 has active request AFTER: ${!!battle.sides[0]?.activeRequest}`
-      );
-      console.log(
-        `P2 has active request AFTER: ${!!battle.sides[1]?.activeRequest}`
-      );
     } catch (error) {
-      console.error('Error submitting moves:', error);
-      const message =
-        error instanceof Error ? error.message : 'Unknown error';
+      const message = error instanceof Error ? error.message : 'Unknown error';
       if (message.includes('Not all choices done')) {
+        session.clearChoices();
         return this.getBattleState(battleId);
       }
 
       // Clear choices on other errors to prevent stuck state
       session.clearChoices();
       throw error;
-    }
-
-    console.log(`Battle log length after: ${battle.log.length}`);
-    console.log(`Battle ended after turn: ${battle.ended}`);
-
-    // Check if the turn actually processed
-    const logLengthDiff = battle.log.length - session.lastLogIndex;
-    console.log(`New log entries added: ${logLengthDiff}`);
-
-    if (logLengthDiff === 0 && !battle.ended) {
-      console.error(
-        '⚠️  WARNING: No new logs generated - turn did NOT process!'
-      );
-      console.error(
-        'Pokemon Showdown queued the moves but did not execute them'
-      );
-      console.error('They will likely process on the next choose() call');
-
-      // Moves can be queued without immediately processing. Keep choices
-      // so the next call can retry the same decisions.
-      return this.getBattleState(battleId);
     }
 
     // Capture NEW logs since last turn
@@ -270,17 +225,10 @@ export class BattleSessionManager {
     // Update the last log index
     session.lastLogIndex = battle.log.length;
 
-    console.log(
-      `New logs captured: ${formattedNewLogs.length} formatted entries`
-    );
-    console.log(`Total turn log entries: ${session.turnLog.length}`);
-
-    session.currentTurn++;
+    session.currentTurn = (battle as unknown as { turn?: number }).turn ?? session.currentTurn + 1;
 
     // Clear choices after successful submission
     session.clearChoices();
-
-    console.log(`Turn processed. Battle ended: ${battle.ended}`);
 
     return this.getBattleState(battleId);
   }
@@ -288,7 +236,7 @@ export class BattleSessionManager {
   getBattleState(battleId: string): BattleState {
     const session = this.sessions.get(battleId);
     if (!session) {
-      throw new Error('Battle not found');
+      throw new NotFoundException('Battle not found');
     }
 
     const { battle } = session;
@@ -297,6 +245,8 @@ export class BattleSessionManager {
 
     const p1Active = p1Side?.active?.[0];
     const p2Active = p2Side?.active?.[0];
+    const p1RequestState = p1Side?.requestState;
+    const p2RequestState = p2Side?.requestState;
 
     // Get available moves for p1
     const availableMoves =
@@ -309,6 +259,16 @@ export class BattleSessionManager {
       })) || [];
 
     // Return accumulated turn logs from the session
+    const pendingPlayers: ('p1' | 'p2')[] = [];
+    if (p1RequestState === 'move' && !session.hasP1Chosen()) pendingPlayers.push('p1');
+    if (p2RequestState === 'move' && !session.hasP2Chosen()) pendingPlayers.push('p2');
+
+    const phase: BattleState['phase'] = battle.ended
+      ? 'ended'
+      : session.bothPlayersChosen()
+        ? 'resolving'
+        : 'awaiting-moves';
+
     return {
       battleId,
       p1Pokemon: {
@@ -328,8 +288,64 @@ export class BattleSessionManager {
       isEnded: battle.ended,
       winner: battle.winner || null,
       currentTurn: session.currentTurn,
-      waitingForMove: !session.bothPlayersChosen(),
+      waitingForMove: p1RequestState === 'move' && !session.hasP1Chosen(),
+      pendingPlayers,
+      phase,
+      lastAction: session.lastAction,
     };
+  }
+
+  private normalizeMoveIndex(
+    session: BattleSession,
+    player: 'p1' | 'p2',
+    moveIndex: number
+  ): number {
+    if (!Number.isInteger(moveIndex)) {
+      throw new BadRequestException('moveIndex must be an integer');
+    }
+
+    const sideIndex = player === 'p1' ? 0 : 1;
+    const requestState = session.battle.sides[sideIndex]?.requestState;
+    if (requestState !== 'move') {
+      throw new BadRequestException(
+        `${player} is not currently allowed to choose a move`
+      );
+    }
+
+    const active = session.battle.sides[sideIndex]?.active?.[0] as
+      | { moveSlots?: Array<{ move: string; disabled?: boolean }> }
+      | undefined;
+    const moveSlots = active?.moveSlots ?? [];
+    if (moveSlots.length === 0) {
+      throw new BadRequestException('No moves available for active Pokemon');
+    }
+
+    const normalized = moveIndex >= 1 ? moveIndex : moveIndex + 1;
+    if (normalized < 1 || normalized > moveSlots.length) {
+      throw new BadRequestException(
+        `moveIndex out of range. Expected 0-${moveSlots.length - 1} or 1-${moveSlots.length}`
+      );
+    }
+
+    const selected = moveSlots[normalized - 1];
+    if (selected?.disabled) {
+      throw new BadRequestException(`${selected.move} is currently disabled`);
+    }
+
+    return normalized;
+  }
+
+  private getMoveName(
+    session: BattleSession,
+    player: 'p1' | 'p2',
+    moveIndex: number
+  ): string | null {
+    const sideIndex = player === 'p1' ? 0 : 1;
+    const active = session.battle.sides[sideIndex]?.active?.[0] as
+      | { moveSlots?: Array<{ move: string }> }
+      | undefined;
+
+    return active?.moveSlots?.[moveIndex - 1]?.move ?? null;
   }
 
   private formatRecentLog(logs: string[]): string[] {
