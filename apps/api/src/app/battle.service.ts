@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
+import { tierToAutoLevel } from './tier-auto-level';
 
 export interface BattleLog {
   rawLog: string[];
@@ -444,7 +445,7 @@ export class BattleService {
     const ability = abilities['0'] || Object.values(abilities)[0] || 'None';
     const level = input.level && Number.isFinite(input.level)
       ? Math.max(1, Math.min(100, Math.floor(input.level)))
-      : 50;
+      : tierToAutoLevel(species.tier);
 
     const set = {
       name: species.name,

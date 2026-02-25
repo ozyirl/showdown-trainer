@@ -1,7 +1,16 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import type { Battle } from 'pokemon-showdown';
 import { BattleService, StartBattleRequest } from './battle.service';
-import { CpuMoveAiService } from './cpu-move-ai.service';
+import {
+  CpuMoveAiService,
+  type CpuMoveDecisionResult,
+} from './cpu-move-ai.service';
+import type { ShowdownRequest } from './battle.service';
 
 export interface BattleState {
   battleId: string;
@@ -40,6 +49,16 @@ export interface BattleState {
     acceptedAt: number;
   } | null;
   lastTurnEvents: BattleTurnEvent[];
+  lastCpuDecision: {
+    moveIndex: number;
+    moveName: string | null;
+    source: 'model' | 'fallback';
+    modelId: string;
+    latencyMs: number;
+    rawResponse?: string;
+    error?: string;
+    turn: number;
+  } | null;
 }
 
 export interface BattleTurnEvent {
@@ -52,6 +71,10 @@ export interface BattleTurnEvent {
     | 'effectiveness'
     | 'crit'
     | 'miss'
+    | 'fail'
+    | 'cant'
+    | 'prepare'
+    | 'activate'
     | 'faint'
     | 'win';
   text: string;
@@ -72,6 +95,8 @@ class BattleSession {
   lastLogIndex = 0; // Track which logs we've already processed
   lastAction: BattleState['lastAction'] = null;
   lastTurnEvents: BattleTurnEvent[] = [];
+  lastCpuDecision: BattleState['lastCpuDecision'] = null;
+  isResolving = false;
 
   constructor(id: string, battle: Battle) {
     this.id = id;
@@ -149,6 +174,7 @@ export class BattleSessionManager {
     session.lastLogIndex = battle.log.length;
 
     this.sessions.set(battleId, session);
+    this.battleService.registerBattleSession(battleId, battle as never, session.lastLogIndex);
 
     return this.getBattleState(battleId);
   }
@@ -165,6 +191,12 @@ export class BattleSessionManager {
 
     if (session.battle.ended) {
       throw new BadRequestException('Battle already ended');
+    }
+
+    if (session.isResolving) {
+      throw new ConflictException(
+        'Turn is already resolving. Wait for CPU move / turn result.'
+      );
     }
 
     const normalizedMoveIndex = this.normalizeMoveIndex(session, player, moveIndex);
@@ -184,16 +216,26 @@ export class BattleSessionManager {
       acceptedAt: Date.now(),
     };
 
-    if (player === 'p1' && this.isCpuAiEnabled() && !session.hasP2Chosen()) {
-      await this.tryChooseCpuMove(session);
-    }
+    try {
+      if (player === 'p1' && this.isCpuAiEnabled() && !session.hasP2Chosen()) {
+        session.isResolving = true;
+        await this.tryChooseCpuMove(session);
+      }
 
-    // If both players have chosen, process the turn
-    if (session.bothPlayersChosen()) {
-      return await this.processTurn(battleId);
-    }
+      // If both players have chosen, process the turn
+      if (session.bothPlayersChosen()) {
+        session.isResolving = true;
+        return await this.processTurn(battleId);
+      }
 
-    return this.getBattleState(battleId);
+      return this.getBattleState(battleId);
+    } finally {
+      // Keep locked only if both choices remain queued and caller should not re-submit.
+      // In normal completion paths processTurn clears choices, so unlock.
+      if (!session.bothPlayersChosen()) {
+        session.isResolving = false;
+      }
+    }
   }
 
   private async processTurn(battleId: string): Promise<BattleState> {
@@ -204,16 +246,8 @@ export class BattleSessionManager {
 
     const { battle } = session;
 
-    const p1RequestState = battle.sides[0]?.requestState;
-    const p2RequestState = battle.sides[1]?.requestState;
-    if (p1RequestState !== 'move' || p2RequestState !== 'move') {
-      // Clear stale queued choices so the next click does not accidentally
-      // resolve a previous turn.
-      session.clearChoices();
-      return this.getBattleState(battleId);
-    }
-
-    // Submit both choices to the battle engine in one pass
+    // Submit both choices for the same turn; Showdown resolves order and
+    // handles request types (move/switch/default) internally.
     try {
       const p1Choice = session.p1MoveChoice;
       const p2Choice = session.p2MoveChoice;
@@ -221,16 +255,30 @@ export class BattleSessionManager {
         throw new BadRequestException('Missing choices for one or both players');
       }
 
-      battle.makeChoices(p1Choice, p2Choice);
+      this.battleService.step(battleId, p1Choice, p2Choice);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
+      if (message.includes('Invalid move choice')) {
+        // Recharge / lock / forced-choice edge cases can make a previously
+        // prepared CPU move invalid by the time we submit. Let Showdown auto-resolve.
+        try {
+          const p1Choice = session.p1MoveChoice;
+          if (p1Choice) {
+            this.battleService.step(battleId, p1Choice, 'default');
+          }
+        } catch {
+          // Fall through to standard error handling below.
+        }
+      }
       if (message.includes('Not all choices done')) {
         session.clearChoices();
+        session.isResolving = false;
         return this.getBattleState(battleId);
       }
 
       // Clear choices on other errors to prevent stuck state
       session.clearChoices();
+      session.isResolving = false;
       throw error;
     }
 
@@ -249,6 +297,7 @@ export class BattleSessionManager {
 
     // Clear choices after successful submission
     session.clearChoices();
+    session.isResolving = false;
 
     return this.getBattleState(battleId);
   }
@@ -295,6 +344,8 @@ export class BattleSessionManager {
       ? 'ended'
       : session.bothPlayersChosen()
         ? 'resolving'
+        : session.isResolving
+          ? 'resolving'
         : 'awaiting-moves';
 
     return {
@@ -323,6 +374,7 @@ export class BattleSessionManager {
       phase,
       lastAction: session.lastAction,
       lastTurnEvents: session.lastTurnEvents,
+      lastCpuDecision: session.lastCpuDecision,
     };
   }
 
@@ -361,6 +413,36 @@ export class BattleSessionManager {
     const selected = moveSlots[normalized - 1];
     if (selected?.disabled) {
       throw new BadRequestException(`${selected.move} is currently disabled`);
+    }
+
+    // Align validation with BattleService.step(), which uses the latest
+    // Showdown request JSON (this can differ from moveSlots during recharge/locks).
+    try {
+      const requests = this.battleService.getRequests(session.id);
+      const request = player === 'p1' ? requests.p1 : requests.p2;
+      const legalMoveChoices = this.getLegalMoveChoicesFromRequest(request);
+      if (legalMoveChoices.length > 0) {
+        const requestedChoice = `move ${normalized}`;
+        if (!legalMoveChoices.includes(requestedChoice)) {
+          // If Showdown only allows one move (common for recharge/locks), auto-coerce.
+          if (legalMoveChoices.length === 1) {
+            const onlyLegal = legalMoveChoices[0];
+            const match = onlyLegal.match(/^move\s+(\d+)$/i);
+            if (match) {
+              return Number(match[1]);
+            }
+          }
+
+          throw new BadRequestException(
+            `Invalid move choice "${requestedChoice}". Legal choices: ${legalMoveChoices.join(', ')}`
+          );
+        }
+      }
+    } catch (error) {
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      // Ignore request lookup issues and fall back to moveSlots validation.
     }
 
     return normalized;
@@ -420,6 +502,29 @@ export class BattleSessionManager {
         case '-miss':
           formatted.push(`${parts[1]?.split(':')[1]?.trim()}'s attack missed!`);
           break;
+        case '-fail':
+          formatted.push('But it failed!');
+          break;
+        case 'cant': {
+          const pokemon = parts[1]?.split(':')[1]?.trim();
+          const reason = parts[2] || 'could not move';
+          formatted.push(`${pokemon} couldn't move (${reason}).`);
+          break;
+        }
+        case '-prepare': {
+          const pokemon = parts[1]?.split(':')[1]?.trim();
+          const moveName = parts[2];
+          formatted.push(`${pokemon} is preparing ${moveName}!`);
+          break;
+        }
+        case '-activate': {
+          const pokemon = parts[1]?.split(':')[1]?.trim();
+          const effect = parts[2];
+          if (effect) {
+            formatted.push(`${pokemon}: ${effect}`);
+          }
+          break;
+        }
       }
     }
     return formatted;
@@ -427,6 +532,7 @@ export class BattleSessionManager {
 
   deleteBattle(battleId: string) {
     this.sessions.delete(battleId);
+    this.battleService.unregisterBattleSession(battleId);
   }
 
   private toHpPercent(hp?: number, maxHp?: number): number {
@@ -514,6 +620,46 @@ export class BattleSessionManager {
             actor: parts[1]?.split(':')[1]?.trim(),
           });
           break;
+        case '-fail': {
+          const target = parts[1]?.split(':')[1]?.trim();
+          events.push({
+            kind: 'fail',
+            text: target ? `${target}'s move failed!` : 'But it failed!',
+            target,
+          });
+          break;
+        }
+        case 'cant': {
+          const actor = parts[1]?.split(':')[1]?.trim();
+          const reason = parts[2] || 'cant';
+          events.push({
+            kind: 'cant',
+            text: `${actor} couldn't move (${reason}).`,
+            actor,
+          });
+          break;
+        }
+        case '-prepare': {
+          const actor = parts[1]?.split(':')[1]?.trim();
+          const moveName = parts[2];
+          events.push({
+            kind: 'prepare',
+            text: `${actor} is preparing ${moveName}!`,
+            actor,
+            moveName,
+          });
+          break;
+        }
+        case '-activate': {
+          const actor = parts[1]?.split(':')[1]?.trim();
+          const effect = parts[2];
+          events.push({
+            kind: 'activate',
+            text: actor && effect ? `${actor}: ${effect}` : 'An effect activated.',
+            actor,
+          });
+          break;
+        }
         case 'faint': {
           const target = parts[1]?.split(':')[1]?.trim();
           events.push({ kind: 'faint', text: `${target} fainted!`, target, hpPercent: 0 });
@@ -580,9 +726,18 @@ export class BattleSessionManager {
     const battle = session.battle as unknown as {
       sides?: Array<{
         requestState?: string;
-        active?: Array<{ name?: string; moveSlots?: Array<{ id?: string; move: string; pp: number; disabled?: boolean }> }>;
+        active?: Array<{
+          name?: string;
+          types?: string[];
+          getTypes?: () => string[];
+          moveSlots?: Array<{ id?: string; move: string; pp: number; disabled?: boolean }>;
+        }>;
       }>;
-      dex?: { moves?: { get?: (idOrName: string) => { type?: string; basePower?: number } | undefined } };
+      dex?: {
+        moves?: { get?: (idOrName: string) => { type?: string; basePower?: number } | undefined };
+        getImmunity?: (source: string, target: unknown) => boolean;
+        getEffectiveness?: (source: string, target: unknown) => number;
+      };
     };
 
     const p2Side = battle.sides?.[1];
@@ -593,6 +748,23 @@ export class BattleSessionManager {
       p2Side.active?.[0]?.moveSlots
         ?.map((slot, index) => {
           const dexMove = battle.dex?.moves?.get?.(slot.id || slot.move);
+          const targetPokemon = p1Side?.active?.[0];
+          const moveType = dexMove?.type;
+          const isImmune =
+            !!moveType &&
+            !!targetPokemon &&
+            battle.dex?.getImmunity
+              ? !battle.dex.getImmunity(moveType, targetPokemon)
+              : false;
+          const typeMod =
+            !!moveType && !!targetPokemon && battle.dex?.getEffectiveness
+              ? battle.dex.getEffectiveness(moveType, targetPokemon)
+              : 0;
+          const effectivenessMultiplier = isImmune
+            ? 0
+            : typeof typeMod === 'number'
+              ? Math.pow(2, typeMod)
+              : 1;
           return {
             index: index + 1,
             name: slot.move,
@@ -602,6 +774,8 @@ export class BattleSessionManager {
                 ? dexMove.basePower
                 : null,
             pp: slot.pp,
+            effectivenessMultiplier,
+            isImmune,
             disabled: !!slot.disabled,
           };
         })
@@ -613,21 +787,83 @@ export class BattleSessionManager {
 
     if (p2MoveChoices.length === 0) return;
 
+    const decision = await this.safeChooseCpuMove(session, p2MoveChoices, {
+      cpuPokemonName: p2Side.active?.[0]?.name || 'Unknown',
+      playerPokemonName: p1Side?.active?.[0]?.name || 'Unknown',
+    });
+
+    const selected = p2MoveChoices.find((move) => move.index === decision.moveIndex);
+    const finalMove = selected ?? p2MoveChoices[0];
+
+    session.p2MoveChoice = `move ${finalMove.index}`;
+    session.lastCpuDecision = {
+      moveIndex: finalMove.index,
+      moveName: finalMove.name,
+      source: decision.source,
+      modelId: decision.modelId,
+      latencyMs: decision.latencyMs,
+      rawResponse: decision.rawResponse,
+      error: decision.error,
+      turn: session.currentTurn + 1,
+    };
+  }
+
+  private async safeChooseCpuMove(
+    session: BattleSession,
+    p2MoveChoices: Array<{
+      index: number;
+      name: string;
+      type?: string;
+      power?: number | null;
+      pp?: number;
+    }>,
+    names: { cpuPokemonName: string; playerPokemonName: string }
+  ): Promise<CpuMoveDecisionResult> {
     try {
-      const decision = await this.cpuMoveAiService.chooseCpuMove({
+      return await this.cpuMoveAiService.chooseCpuMove({
         battleId: session.id,
         turn: session.currentTurn + 1,
-        cpuPokemonName: p2Side.active?.[0]?.name || 'Unknown',
-        playerPokemonName: p1Side?.active?.[0]?.name || 'Unknown',
+        cpuPokemonName: names.cpuPokemonName,
+        playerPokemonName: names.playerPokemonName,
         availableMoves: p2MoveChoices,
-        recentLog: session.turnLog.slice(-8),
+        recentLog: session.turnLog.slice(-4),
+        cpuPokemonTypes: this.getPokemonTypes(session.battle.sides[1]?.active?.[0]),
+        playerPokemonTypes: this.getPokemonTypes(session.battle.sides[0]?.active?.[0]),
       });
-
-      const selected = p2MoveChoices.find((move) => move.index === decision.moveIndex);
-      session.p2MoveChoice = `move ${selected?.index ?? p2MoveChoices[0].index}`;
-    } catch {
-      // Scaffold fallback keeps gameplay working if AI SDK packages are not installed yet.
-      session.p2MoveChoice = `move ${p2MoveChoices[0].index}`;
+    } catch (error) {
+      if (process.env.OPENAI_CPU_STRICT === 'true') {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        moveIndex: p2MoveChoices[0].index,
+        source: 'fallback',
+        modelId: process.env.OPENAI_CPU_MODEL || 'gpt-4.1-mini',
+        latencyMs: 0,
+        error: message,
+      };
     }
+  }
+
+  private getPokemonTypes(
+    pokemon: unknown
+  ): string[] | undefined {
+    const p = pokemon as { types?: string[]; getTypes?: () => string[] } | undefined;
+    if (!p) return undefined;
+    if (Array.isArray(p.types) && p.types.length > 0) return p.types;
+    try {
+      const types = p.getTypes?.();
+      return Array.isArray(types) ? types : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private getLegalMoveChoicesFromRequest(request: ShowdownRequest): string[] {
+    const moves = request.active?.[0]?.moves ?? [];
+    return moves
+      .map((move, index) => ({ move, index: index + 1 }))
+      .filter(({ move }) => !move.disabled && (move.pp ?? 1) > 0)
+      .map(({ index }) => `move ${index}`);
   }
 }
