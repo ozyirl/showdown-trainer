@@ -7,9 +7,10 @@ import { BattleSessionManager } from './battle-session.manager';
 import { OrgCommonModule } from '@org/common';
 import { BattleEngineModule } from '@org/battle-engine';
 import { CpuMoveAiService } from './cpu-move-ai.service';
+import { TeamsModule } from './teams/teams.module';
 
 @Module({
-  imports: [OrgCommonModule, BattleEngineModule],
+  imports: [OrgCommonModule, BattleEngineModule, TeamsModule],
   controllers: [AppController, BattleController],
   providers: [
     AppService,
