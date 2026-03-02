@@ -24,6 +24,35 @@ describe('BattleSessionManager 6v6 flow', () => {
     expect(state.sides.p2.active).toBeTruthy();
   });
 
+  it('generates seeded random teams instead of dex-first static teams', async () => {
+    const config = {
+      randomTeams: true,
+      randomTeamFormatid: 'gen9randombattle',
+      randomSeed: [1, 2, 3, 4],
+    };
+    const stateA = await manager.createBattle(config);
+    const stateB = await manager.createBattle(config);
+    const stateC = await manager.createBattle({
+      ...config,
+      randomSeed: [9, 10, 11, 12],
+    });
+
+    const p1A = stateA.sides.p1.team.map((pokemon) => pokemon.name);
+    const p1B = stateB.sides.p1.team.map((pokemon) => pokemon.name);
+    const p1C = stateC.sides.p1.team.map((pokemon) => pokemon.name);
+
+    expect(p1A).toEqual(p1B);
+    expect(p1A).not.toEqual(p1C);
+    expect(p1A).not.toEqual([
+      'Bulbasaur',
+      'Ivysaur',
+      'Venusaur',
+      'Charmander',
+      'Charmeleon',
+      'Charizard',
+    ]);
+  });
+
   it('exposes legal switches when bench pokemon are available', async () => {
     const state = await manager.createBattle();
 

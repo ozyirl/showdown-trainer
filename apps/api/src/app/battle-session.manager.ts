@@ -13,7 +13,6 @@ import {
 } from './battle.service';
 import {
   CpuMoveAiService,
-  type CpuMoveDecisionResult,
 } from './cpu-move-ai.service';
 
 export interface BattlePokemonState {
@@ -180,16 +179,20 @@ export class BattleSessionManager {
       fallbackSpecies: config?.p1Pokemon,
       fallbackMoves: config?.p1Moves,
       fallbackLevel: config?.level,
-      defaultOffset: 0,
       size: 6,
+      randomTeams: config?.randomTeams,
+      randomTeamFormatid: config?.randomTeamFormatid,
+      randomSeed: this.seedForSide(config?.randomSeed, 0),
     });
     const p2Built = await this.battleService.buildTeam({
       team: config?.p2Team,
       fallbackSpecies: config?.p2Pokemon,
       fallbackMoves: config?.p2Moves,
       fallbackLevel: config?.level,
-      defaultOffset: 30,
       size: 6,
+      randomTeams: config?.randomTeams,
+      randomTeamFormatid: config?.randomTeamFormatid,
+      randomSeed: this.seedForSide(config?.randomSeed, 1),
     });
 
     const battle = new Battle({
@@ -446,6 +449,13 @@ export class BattleSessionManager {
     return normalized;
   }
 
+  private seedForSide(seed: number[] | undefined, sideOffset: number): number[] | undefined {
+    if (!Array.isArray(seed) || seed.length !== 4) return undefined;
+    return seed.map((value, index) =>
+      Math.max(0, Math.floor(Number(value) || 0) + sideOffset + index)
+    );
+  }
+
   private normalizePlayerChoice(
     player: 'p1' | 'p2',
     request: ShowdownRequest,
@@ -559,48 +569,93 @@ export class BattleSessionManager {
       return;
     }
 
-    if (p2Legal.forceSwitch || (p2Legal.switchChoices.length > 0 && p2Legal.moveChoices.length === 0)) {
-      const selectedSwitch = this.chooseBestSwitch(requests.p2, p2Legal.switchChoices);
-      session.setChoice('p2', selectedSwitch);
+    const battle = session.battle as unknown as BattleWithDex;
+    const p1Active = battle.sides?.[0]?.active?.[0];
+    const p2Active = battle.sides?.[1]?.active?.[0];
+    const p2MoveChoices = this.getLegalCpuMoveChoices(battle, requests, p2Legal);
+    const p2SwitchChoices = this.getLegalCpuSwitchChoices(requests.p2, p2Legal);
+
+    if (!this.isCpuAiEnabled()) {
+      const fallback = this.getFallbackCpuChoice(
+        p2MoveChoices,
+        p2SwitchChoices,
+        !!p2Legal.forceSwitch
+      );
+      session.setChoice('p2', fallback.choice);
       session.lastCpuDecision = {
-        choice: selectedSwitch,
-        actionType: 'switch',
+        choice: fallback.choice,
+        actionType: fallback.actionType,
         source: 'fallback',
         modelId: this.cpuMoveAiService.getDefaultModelId(),
         latencyMs: 0,
-        reasoning: 'Selected highest remaining HP switch target',
+        reasoning: 'Deterministic fallback action',
         turn: session.currentTurn + 1,
       };
       return;
     }
 
-    if (p2Legal.moveChoices.length > 0) {
-      await this.chooseCpuMoveAction(session, requests, p2Legal);
-      return;
+    try {
+      const decision = await this.cpuMoveAiService.chooseCpuAction({
+        battleId: session.id,
+        turn: session.currentTurn + 1,
+        cpuPokemonName: p2Active?.name || 'Unknown',
+        playerPokemonName: p1Active?.name || 'Unknown',
+        forceSwitch: !!p2Legal.forceSwitch,
+        availableMoves: p2MoveChoices,
+        availableSwitches: p2SwitchChoices,
+        recentLog: session.turnLog.slice(-4),
+        cpuPokemonTypes: this.getPokemonTypes(session.battle.sides[1]?.active?.[0]),
+        playerPokemonTypes: this.getPokemonTypes(session.battle.sides[0]?.active?.[0]),
+      });
+      session.setChoice('p2', decision.choice);
+      session.lastCpuDecision = {
+        choice: decision.choice,
+        actionType: decision.actionType,
+        source: decision.source,
+        modelId: decision.modelId,
+        latencyMs: decision.latencyMs,
+        reasoning: decision.reasoning,
+        rawResponse: decision.rawResponse,
+        error: decision.error,
+        turn: session.currentTurn + 1,
+      };
+    } catch (error) {
+      if (process.env.OPENAI_CPU_STRICT === 'true') {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      const fallback = this.getFallbackCpuChoice(
+        p2MoveChoices,
+        p2SwitchChoices,
+        !!p2Legal.forceSwitch
+      );
+      session.setChoice('p2', fallback.choice);
+      session.lastCpuDecision = {
+        choice: fallback.choice,
+        actionType: fallback.actionType,
+        source: 'fallback',
+        modelId: process.env.OPENAI_CPU_MODEL || 'gpt-4.1-mini',
+        latencyMs: 0,
+        reasoning: 'Fallback action after agent error',
+        error: message,
+      };
     }
-
-    const defaultChoice = this.pickDefaultChoice(p2Legal);
-    session.setChoice('p2', defaultChoice);
-    session.lastCpuDecision = {
-      choice: defaultChoice,
-      actionType: 'default',
-      source: 'fallback',
-      modelId: this.cpuMoveAiService.getDefaultModelId(),
-      latencyMs: 0,
-      reasoning: 'Default action selected',
-      turn: session.currentTurn + 1,
-    };
   }
 
-  private async chooseCpuMoveAction(
-    session: BattleSession,
+  private getLegalCpuMoveChoices(
+    battle: BattleWithDex,
     requests: { p1: ShowdownRequest; p2: ShowdownRequest },
     p2Legal: ShowdownLegalOptions
-  ): Promise<void> {
-    const battle = session.battle as unknown as BattleWithDex;
+  ): Array<{
+    index: number;
+    name: string;
+    type?: string;
+    power?: number | null;
+    pp?: number;
+    effectivenessMultiplier?: number;
+    isImmune?: boolean;
+  }> {
     const p1Active = battle.sides?.[0]?.active?.[0];
-    const p2Active = battle.sides?.[1]?.active?.[0];
-
     const moveRequests = requests.p2.active?.[0]?.moves ?? [];
     const legalMoveIndices = new Set(
       p2Legal.moveChoices
@@ -611,9 +666,11 @@ export class BattleSessionManager {
         .filter((index): index is number => typeof index === 'number')
     );
 
-    const p2MoveChoices = moveRequests
+    return moveRequests
       .map((move, index) => ({ move, index: index + 1 }))
-      .filter(({ index, move }) => legalMoveIndices.has(index) && (move.pp ?? 1) > 0 && !move.disabled)
+      .filter(
+        ({ index, move }) => legalMoveIndices.has(index) && (move.pp ?? 1) > 0 && !move.disabled
+      )
       .map(({ move, index }) => {
         const dexMove = battle.dex?.moves?.get?.(move.id || move.move);
         const moveType = dexMove?.type;
@@ -641,58 +698,14 @@ export class BattleSessionManager {
           isImmune,
         };
       });
-
-    if (p2MoveChoices.length === 0) {
-      const fallbackChoice = this.pickDefaultChoice(p2Legal);
-      session.setChoice('p2', fallbackChoice);
-      return;
-    }
-
-    const deterministicFallback = this.pickDeterministicMoveIndex(p2MoveChoices);
-
-    let decision: CpuMoveDecisionResult;
-    if (this.isCpuAiEnabled()) {
-      decision = await this.safeChooseCpuMove(session, p2MoveChoices, {
-        cpuPokemonName: p2Active?.name || 'Unknown',
-        playerPokemonName: p1Active?.name || 'Unknown',
-      });
-    } else {
-      decision = {
-        moveIndex: deterministicFallback,
-        source: 'fallback',
-        modelId: this.cpuMoveAiService.getDefaultModelId(),
-        latencyMs: 0,
-        reasoning: 'Deterministic fallback move',
-      };
-    }
-
-    const selected =
-      p2MoveChoices.find((move) => move.index === decision.moveIndex) ||
-      p2MoveChoices.find((move) => move.index === deterministicFallback) ||
-      p2MoveChoices[0];
-    const finalChoice = `move ${selected.index}`;
-
-    session.setChoice('p2', finalChoice);
-    session.lastCpuDecision = {
-      choice: finalChoice,
-      actionType: 'move',
-      source: decision.source,
-      modelId: decision.modelId,
-      latencyMs: decision.latencyMs,
-      reasoning: decision.reasoning,
-      rawResponse: decision.rawResponse,
-      error: decision.error,
-      turn: session.currentTurn + 1,
-    };
   }
 
-  private chooseBestSwitch(request: ShowdownRequest, legalSwitchChoices: string[]): string {
-    if (legalSwitchChoices.length <= 1) {
-      return legalSwitchChoices[0] ?? 'default';
-    }
-
-    const legalSlots = new Set(
-      legalSwitchChoices
+  private getLegalCpuSwitchChoices(
+    request: ShowdownRequest,
+    p2Legal: ShowdownLegalOptions
+  ): Array<{ slot: number; name: string; hpPercent: number; status?: string | null }> {
+    const legalSwitchSlots = new Set(
+      p2Legal.switchChoices
         .map((choice) => {
           const match = choice.match(/^switch\s+(\d+)$/i);
           return match ? Number(match[1]) : null;
@@ -700,44 +713,49 @@ export class BattleSessionManager {
         .filter((slot): slot is number => typeof slot === 'number')
     );
 
-    const party = request.side?.pokemon ?? [];
-    const candidates = party
+    return (request.side?.pokemon ?? [])
       .map((pokemon, index) => ({ pokemon, slot: index + 1 }))
-      .filter(({ slot }) => legalSlots.has(slot))
+      .filter(({ slot }) => legalSwitchSlots.has(slot))
       .map(({ pokemon, slot }) => {
         const parsed = this.parseCondition(pokemon.condition);
         return {
           slot,
+          name: this.extractNameFromIdent(pokemon.ident, pokemon.details),
           hpPercent: parsed.hpPercent,
           status: parsed.status,
         };
-      })
-      .sort((a, b) => {
-        if (b.hpPercent !== a.hpPercent) return b.hpPercent - a.hpPercent;
-        if (a.status && !b.status) return 1;
-        if (!a.status && b.status) return -1;
-        return a.slot - b.slot;
       });
-
-    if (candidates.length === 0) {
-      return legalSwitchChoices[0];
-    }
-    return `switch ${candidates[0].slot}`;
   }
 
-  private pickDeterministicMoveIndex(
-    choices: Array<{
+  private getFallbackCpuChoice(
+    moveChoices: Array<{
       index: number;
       power?: number | null;
       pp?: number;
       effectivenessMultiplier?: number;
       isImmune?: boolean;
-    }>
-  ): number {
-    const nonImmune = choices.filter((choice) => !choice.isImmune);
-    const pool = nonImmune.length > 0 ? nonImmune : choices;
+    }>,
+    switchChoices: Array<{ slot: number; hpPercent: number; status?: string | null }>,
+    forceSwitch: boolean
+  ): { choice: string; actionType: 'move' | 'switch' | 'default' } {
+    if (forceSwitch || moveChoices.length === 0) {
+      if (switchChoices.length === 0) {
+        return { choice: 'default', actionType: 'default' };
+      }
+      const bestSwitch = [...switchChoices].sort((a, b) => {
+        if (b.hpPercent !== a.hpPercent) return b.hpPercent - a.hpPercent;
+        if (a.status && !b.status) return 1;
+        if (!a.status && b.status) return -1;
+        return a.slot - b.slot;
+      })[0];
+      return { choice: `switch ${bestSwitch.slot}`, actionType: 'switch' };
+    }
 
-    const sorted = [...pool].sort((a, b) => {
+    const pool =
+      moveChoices.filter((choice) => !choice.isImmune).length > 0
+        ? moveChoices.filter((choice) => !choice.isImmune)
+        : moveChoices;
+    const bestMove = [...pool].sort((a, b) => {
       const effA = a.effectivenessMultiplier ?? 1;
       const effB = b.effectivenessMultiplier ?? 1;
       if (effB !== effA) return effB - effA;
@@ -748,53 +766,12 @@ export class BattleSessionManager {
       const ppB = b.pp ?? 0;
       if (ppB !== ppA) return ppB - ppA;
       return a.index - b.index;
-    });
-
-    return sorted[0].index;
+    })[0];
+    return { choice: `move ${bestMove.index}`, actionType: 'move' };
   }
 
   private isCpuAiEnabled(): boolean {
     return process.env.ENABLE_CPU_AI === 'true';
-  }
-
-  private async safeChooseCpuMove(
-    session: BattleSession,
-    p2MoveChoices: Array<{
-      index: number;
-      name: string;
-      type?: string;
-      power?: number | null;
-      pp?: number;
-      effectivenessMultiplier?: number;
-      isImmune?: boolean;
-    }>,
-    names: { cpuPokemonName: string; playerPokemonName: string }
-  ): Promise<CpuMoveDecisionResult> {
-    try {
-      return await this.cpuMoveAiService.chooseCpuMove({
-        battleId: session.id,
-        turn: session.currentTurn + 1,
-        cpuPokemonName: names.cpuPokemonName,
-        playerPokemonName: names.playerPokemonName,
-        availableMoves: p2MoveChoices,
-        recentLog: session.turnLog.slice(-4),
-        cpuPokemonTypes: this.getPokemonTypes(session.battle.sides[1]?.active?.[0]),
-        playerPokemonTypes: this.getPokemonTypes(session.battle.sides[0]?.active?.[0]),
-      });
-    } catch (error) {
-      if (process.env.OPENAI_CPU_STRICT === 'true') {
-        throw error;
-      }
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      const fallbackMoveIndex = this.pickDeterministicMoveIndex(p2MoveChoices);
-      return {
-        moveIndex: fallbackMoveIndex,
-        source: 'fallback',
-        modelId: process.env.OPENAI_CPU_MODEL || 'gpt-4.1-mini',
-        latencyMs: 0,
-        error: message,
-      };
-    }
   }
 
   private getPokemonTypes(pokemon: unknown): string[] | undefined {

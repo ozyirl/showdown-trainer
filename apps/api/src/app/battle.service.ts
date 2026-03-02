@@ -35,6 +35,9 @@ export interface StartBattleRequest {
   p2Team?: StartBattleTeamInput[];
   p1TeamPreviewChoice?: string;
   p2TeamPreviewChoice?: string;
+  randomTeams?: boolean;
+  randomTeamFormatid?: string;
+  randomSeed?: number[];
   p1Pokemon?: string;
   p2Pokemon?: string;
   p1Moves?: string[];
@@ -500,13 +503,34 @@ export class BattleService {
     fallbackSpecies?: string;
     fallbackMoves?: string[];
     fallbackLevel?: number;
-    defaultOffset?: number;
     size?: number;
+    randomTeams?: boolean;
+    randomTeamFormatid?: string;
+    randomSeed?: number[];
   }): Promise<BuiltTeam> {
     const { Teams } = await import('pokemon-showdown');
     const targetSize = Math.max(1, Math.min(6, Math.floor(input.size ?? 6)));
     const normalizedTeam = this.normalizeTeamInputs(input.team, targetSize);
     const members: BuiltPokemonSet[] = [];
+    const shouldGenerateRandomTeam =
+      (input.randomTeams ?? true) &&
+      normalizedTeam.length === 0 &&
+      !input.fallbackSpecies;
+
+    if (shouldGenerateRandomTeam) {
+      const randomSets = Teams.generate(input.randomTeamFormatid ?? 'gen9randombattle', {
+        seed: this.normalizeSeed(input.randomSeed),
+      }).slice(0, targetSize) as PokemonSetLike[];
+
+      return {
+        packed: Teams.pack(randomSets),
+        members: randomSets.map((set) => ({
+          set,
+          speciesName: set.species || set.name,
+          moves: set.moves || [],
+        })),
+      };
+    }
 
     if (normalizedTeam.length > 0) {
       for (const member of normalizedTeam) {
@@ -527,18 +551,9 @@ export class BattleService {
         })
       );
     } else {
-      const defaultSpecies = await this.getDefaultSpeciesList(
-        targetSize,
-        input.defaultOffset ?? 0
+      throw new BadRequestException(
+        'Team generation failed: no team, fallback species, or random generation'
       );
-      for (const species of defaultSpecies) {
-        members.push(
-          await this.buildPokemonSet({
-            speciesName: species,
-            level: input.fallbackLevel,
-          })
-        );
-      }
     }
 
     return {
@@ -823,32 +838,15 @@ export class BattleService {
     return normalized.slice(0, maxSize);
   }
 
-  private async getDefaultSpeciesList(size: number, offset: number): Promise<string[]> {
-    const { Dex } = await import('pokemon-showdown');
-    const allSpecies = Dex.species
-      .all()
-      .filter((species: DexSpeciesLike) => {
-        if (!species?.exists || species.num <= 0) return false;
-        if (species.isNonstandard && species.isNonstandard !== null) return false;
-        if (species.battleOnly) return false;
-        return !!species.name;
-      })
-      .sort(
-        (a: DexSpeciesLike, b: DexSpeciesLike) =>
-          a.num - b.num || a.name.localeCompare(b.name)
-      );
-
-    if (allSpecies.length === 0) {
-      throw new BadRequestException('No legal species available for default team generation');
+  private normalizeSeed(seed: number[] | undefined): [number, number, number, number] | undefined {
+    if (!Array.isArray(seed) || seed.length !== 4) {
+      return undefined;
     }
-
-    const selected: string[] = [];
-    let cursor = ((offset % allSpecies.length) + allSpecies.length) % allSpecies.length;
-    while (selected.length < size) {
-      selected.push(allSpecies[cursor].name);
-      cursor = (cursor + 1) % allSpecies.length;
+    const values = seed.map((value) => Math.max(0, Math.floor(Number(value) || 0)));
+    if (values.some((value) => !Number.isFinite(value))) {
+      return undefined;
     }
-    return selected;
+    return values as [number, number, number, number];
   }
 
   /**
