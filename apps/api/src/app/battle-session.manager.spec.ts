@@ -144,7 +144,17 @@ describe('BattleSessionManager 6v6 flow', () => {
             allChoices: ['move 1'],
           };
         }),
-      step: jest.fn().mockReturnValue({ rawLogDelta: ['|turn|1'] }),
+      step: jest.fn().mockReturnValue({
+        rawLogDelta: ['|turn|1'],
+        requests: {
+          p1: {
+            active: [{ moves: [{ move: 'Tackle', pp: 31, disabled: false }] }],
+            side: { pokemon: [{ active: true, condition: '100/100' }] },
+          },
+          p2: { wait: true },
+        },
+        ended: false,
+      }),
       unregisterBattleSession: jest.fn(),
     } as unknown as BattleService;
 
@@ -197,6 +207,139 @@ describe('BattleSessionManager 6v6 flow', () => {
     expect(result.phase).toBe('awaiting-actions');
     expect(fakeSession.isResolving).toBe(false);
     expect(battleServiceMock.step).toHaveBeenCalled();
+  });
+
+  it('auto-resolves cpu forced switch after faint when p1 has no action', async () => {
+    const realBattleService = new BattleService();
+    const reqMoveVsMove: ShowdownRequest = {
+      active: [{ moves: [{ move: 'Tackle', pp: 32, disabled: false }] }],
+      side: {
+        pokemon: [
+          { ident: 'p1: A', active: true, condition: '100/100' },
+          { ident: 'p1: B', active: false, condition: '100/100' },
+        ],
+      },
+    };
+    const reqCpuForceSwitch: ShowdownRequest = {
+      wait: true,
+      side: {
+        pokemon: [{ ident: 'p1: A', active: true, condition: '100/100' }],
+      },
+    };
+    const reqCpuForceSwitchP2: ShowdownRequest = {
+      forceSwitch: [true],
+      side: {
+        pokemon: [
+          { ident: 'p2: KO', active: true, condition: '0 fnt' },
+          { ident: 'p2: Bench', active: false, condition: '100/100' },
+        ],
+      },
+    };
+    const reqPostSwitch: ShowdownRequest = {
+      active: [{ moves: [{ move: 'Tackle', pp: 30, disabled: false }] }],
+      side: {
+        pokemon: [{ ident: 'p1: A', active: true, condition: '100/100' }],
+      },
+    };
+    const reqPostSwitchP2: ShowdownRequest = {
+      wait: true,
+      side: {
+        pokemon: [
+          { ident: 'p2: Bench', active: true, condition: '100/100' },
+          { ident: 'p2: KO', active: false, condition: '0 fnt' },
+        ],
+      },
+    };
+
+    let phase = 0;
+    const stepCalls: Array<{ p1: string; p2: string }> = [];
+    const battleServiceMock = {
+      getRequests: jest.fn().mockImplementation(() => {
+        if (phase === 0) return { p1: reqMoveVsMove, p2: reqMoveVsMove };
+        if (phase === 1) return { p1: reqCpuForceSwitch, p2: reqCpuForceSwitchP2 };
+        return { p1: reqPostSwitch, p2: reqPostSwitchP2 };
+      }),
+      getLegalOptionsForRequest: realBattleService.getLegalOptionsForRequest.bind(
+        realBattleService
+      ),
+      step: jest.fn().mockImplementation((_battleId: string, p1: string, p2: string) => {
+        stepCalls.push({ p1, p2 });
+        if (phase === 0) {
+          phase = 1;
+          return {
+            rawLogDelta: ['|faint|p2a: KO'],
+            requests: { p1: reqCpuForceSwitch, p2: reqCpuForceSwitchP2 },
+            ended: false,
+          };
+        }
+        phase = 2;
+        return {
+          rawLogDelta: ['|switch|p2a: Bench|Bench, L50|100/100'],
+          requests: { p1: reqPostSwitch, p2: reqPostSwitchP2 },
+          ended: false,
+        };
+      }),
+      unregisterBattleSession: jest.fn(),
+    } as unknown as BattleService;
+
+    const cpuMock = {
+      getDefaultModelId: () => 'test-model',
+      chooseCpuAction: jest.fn(),
+      chooseCpuMove: jest.fn(),
+    } as unknown as CpuMoveAiService;
+
+    const localManager = new BattleSessionManager(battleServiceMock, cpuMock);
+    const fakeSession = {
+      id: 'fake-battle-switch',
+      battle: {
+        ended: false,
+        winner: null,
+        log: [],
+        sides: [
+          {
+            pokemon: [{ name: 'A', position: 0, hp: 100, maxhp: 100, isActive: true }],
+            active: [{ moveSlots: [{ maxpp: 32 }] }],
+          },
+          {
+            pokemon: [
+              { name: 'KO', position: 0, hp: 0, maxhp: 100, fainted: true, isActive: false },
+              { name: 'Bench', position: 1, hp: 100, maxhp: 100, isActive: true },
+            ],
+            active: [{ moveSlots: [] }],
+          },
+        ],
+      },
+      p1Choice: null as string | null,
+      p2Choice: null as string | null,
+      turnLog: [] as string[],
+      currentTurn: 0,
+      lastLogIndex: 0,
+      lastAction: null,
+      lastTurnEvents: [],
+      lastCpuDecision: null,
+      isResolving: false,
+      hasChoice(player: 'p1' | 'p2') {
+        return player === 'p1' ? this.p1Choice !== null : this.p2Choice !== null;
+      },
+      setChoice(player: 'p1' | 'p2', choice: string) {
+        if (player === 'p1') this.p1Choice = choice;
+        else this.p2Choice = choice;
+      },
+      clearChoices() {
+        this.p1Choice = null;
+        this.p2Choice = null;
+      },
+    };
+
+    (localManager as unknown as { sessions: Map<string, unknown> }).sessions.set(
+      'fake-battle-switch',
+      fakeSession
+    );
+
+    await localManager.submitAction('fake-battle-switch', 'p1', 'move 1');
+
+    expect(stepCalls[0]).toEqual({ p1: 'move 1', p2: 'move 1' });
+    expect(stepCalls[1]).toEqual({ p1: 'default', p2: 'switch 2' });
   });
 
   it('cpu chooses legal action for move and switch phases', async () => {

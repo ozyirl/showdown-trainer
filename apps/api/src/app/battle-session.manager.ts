@@ -315,22 +315,59 @@ export class BattleSessionManager {
       throw new NotFoundException('Battle not found');
     }
 
-    const p1Choice =
-      session.p1Choice ?? this.pickDefaultChoice(this.battleService.getLegalOptionsForRequest(requests.p1));
-    const p2Choice =
-      session.p2Choice ?? this.pickDefaultChoice(this.battleService.getLegalOptionsForRequest(requests.p2));
+    let workingRequests = requests;
+    let safetyCounter = 0;
+    const aggregatedEvents: BattleTurnEvent[] = [];
 
     try {
-      const stepResult = this.battleService.step(battleId, p1Choice, p2Choice);
-      const newLogs = stepResult.rawLogDelta;
-      const formattedNewLogs = this.formatRecentLog(newLogs);
+      while (safetyCounter < 6) {
+        safetyCounter++;
+        const p1Legal = this.battleService.getLegalOptionsForRequest(workingRequests.p1);
+        const p2Legal = this.battleService.getLegalOptionsForRequest(workingRequests.p2);
 
-      session.lastTurnEvents = this.buildTurnEvents(newLogs);
-      session.turnLog.push(...formattedNewLogs);
-      session.lastLogIndex = session.battle.log.length;
-      session.currentTurn =
-        (session.battle as unknown as { turn?: number }).turn ??
-        session.currentTurn + 1;
+        const p1Choice = session.p1Choice ?? this.pickDefaultChoice(p1Legal);
+        const p2Choice = session.p2Choice ?? this.pickDefaultChoice(p2Legal);
+
+        const stepResult = this.battleService.step(battleId, p1Choice, p2Choice);
+        const newLogs = stepResult.rawLogDelta;
+        const formattedNewLogs = this.formatRecentLog(newLogs);
+        const turnEvents = this.buildTurnEvents(newLogs);
+
+        aggregatedEvents.push(...turnEvents);
+        session.turnLog.push(...formattedNewLogs);
+        session.lastLogIndex = session.battle.log.length;
+        session.currentTurn =
+          (session.battle as unknown as { turn?: number }).turn ??
+          session.currentTurn + 1;
+
+        session.clearChoices();
+        workingRequests = stepResult.requests;
+
+        if (stepResult.ended) {
+          break;
+        }
+
+        // Auto-advance CPU-only pending phases (commonly forced switch after faint)
+        // so the battle doesn't stall when p1 has no actionable request.
+        const nextP1Legal = this.battleService.getLegalOptionsForRequest(workingRequests.p1);
+        const nextP2Legal = this.battleService.getLegalOptionsForRequest(workingRequests.p2);
+        const p1NeedsChoice = this.playerNeedsChoice('p1', nextP1Legal);
+        const p2NeedsChoice = this.playerNeedsChoice('p2', nextP2Legal);
+
+        if (p1NeedsChoice) {
+          break;
+        }
+        if (!p2NeedsChoice) {
+          break;
+        }
+
+        await this.tryChooseCpuAction(session, workingRequests);
+        this.autofillNonActionableChoices(session, workingRequests);
+
+        if (!this.isReadyToResolve(session, workingRequests)) {
+          break;
+        }
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
       if (message.includes('Not all choices done')) {
@@ -344,6 +381,7 @@ export class BattleSessionManager {
       throw error;
     }
 
+    session.lastTurnEvents = this.compactTurnEvents(aggregatedEvents);
     session.clearChoices();
     session.isResolving = false;
 
