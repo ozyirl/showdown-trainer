@@ -31,6 +31,10 @@ export interface PokemonMoveItem {
 }
 
 export interface StartBattleRequest {
+  p1Team?: StartBattleTeamInput[];
+  p2Team?: StartBattleTeamInput[];
+  p1TeamPreviewChoice?: string;
+  p2TeamPreviewChoice?: string;
   p1Pokemon?: string;
   p2Pokemon?: string;
   p1Moves?: string[];
@@ -38,6 +42,14 @@ export interface StartBattleRequest {
   level?: number;
   formatid?: string;
 }
+
+export interface StartBattleTeamMemberInput {
+  species: string;
+  moves?: string[];
+  level?: number;
+}
+
+export type StartBattleTeamInput = string | StartBattleTeamMemberInput;
 
 export interface ShowdownRequestMoveOption {
   move: string;
@@ -55,6 +67,7 @@ export interface ShowdownRequestSidePokemon {
   active?: boolean;
   condition?: string;
   fainted?: boolean;
+  details?: string;
 }
 
 export interface ShowdownRequest {
@@ -72,6 +85,16 @@ export interface ShowdownRequestsBySide {
   p2: ShowdownRequest;
 }
 
+export interface ShowdownLegalOptions {
+  needsChoice: boolean;
+  wait: boolean;
+  teamPreview: boolean;
+  forceSwitch: boolean;
+  moveChoices: string[];
+  switchChoices: string[];
+  allChoices: string[];
+}
+
 export interface BattleStepResult {
   rawLogDelta: string[];
   requests: ShowdownRequestsBySide;
@@ -83,6 +106,11 @@ interface BuiltPokemonSet {
   set: PokemonSetLike;
   speciesName: string;
   moves: string[];
+}
+
+export interface BuiltTeam {
+  packed: string;
+  members: BuiltPokemonSet[];
 }
 
 interface PokemonSetLike {
@@ -467,6 +495,113 @@ export class BattleService {
     };
   }
 
+  async buildTeam(input: {
+    team?: StartBattleTeamInput[];
+    fallbackSpecies?: string;
+    fallbackMoves?: string[];
+    fallbackLevel?: number;
+    defaultOffset?: number;
+    size?: number;
+  }): Promise<BuiltTeam> {
+    const { Teams } = await import('pokemon-showdown');
+    const targetSize = Math.max(1, Math.min(6, Math.floor(input.size ?? 6)));
+    const normalizedTeam = this.normalizeTeamInputs(input.team, targetSize);
+    const members: BuiltPokemonSet[] = [];
+
+    if (normalizedTeam.length > 0) {
+      for (const member of normalizedTeam) {
+        members.push(
+          await this.buildPokemonSet({
+            speciesName: member.species,
+            selectedMoves: member.moves,
+            level: member.level ?? input.fallbackLevel,
+          })
+        );
+      }
+    } else if (input.fallbackSpecies) {
+      members.push(
+        await this.buildPokemonSet({
+          speciesName: input.fallbackSpecies,
+          selectedMoves: input.fallbackMoves,
+          level: input.fallbackLevel,
+        })
+      );
+    } else {
+      const defaultSpecies = await this.getDefaultSpeciesList(
+        targetSize,
+        input.defaultOffset ?? 0
+      );
+      for (const species of defaultSpecies) {
+        members.push(
+          await this.buildPokemonSet({
+            speciesName: species,
+            level: input.fallbackLevel,
+          })
+        );
+      }
+    }
+
+    return {
+      packed: Teams.pack(members.map((member) => member.set)),
+      members,
+    };
+  }
+
+  getLegalOptionsForRequest(request: ShowdownRequest): ShowdownLegalOptions {
+    const wait = !!request.wait;
+    const teamPreview = !!request.teamPreview;
+    const forceSwitch = !!request.forceSwitch?.[0];
+    if (wait) {
+      return {
+        needsChoice: false,
+        wait,
+        teamPreview,
+        forceSwitch,
+        moveChoices: [],
+        switchChoices: [],
+        allChoices: ['default'],
+      };
+    }
+
+    if (teamPreview) {
+      const sideCount = Math.max(1, request.side?.pokemon?.length ?? 6);
+      const defaultTeamChoice = `team ${Array.from(
+        { length: sideCount },
+        (_, index) => index + 1
+      ).join('')}`;
+      return {
+        needsChoice: true,
+        wait,
+        teamPreview: true,
+        forceSwitch: false,
+        moveChoices: [],
+        switchChoices: [],
+        allChoices: [defaultTeamChoice],
+      };
+    }
+
+    const moveChoices = this.getLegalMoveChoices(request);
+    const switchChoices = this.getLegalSwitchChoices(request);
+    const allChoices = forceSwitch ? switchChoices : [...moveChoices, ...switchChoices];
+
+    return {
+      needsChoice: true,
+      wait,
+      teamPreview: false,
+      forceSwitch,
+      moveChoices,
+      switchChoices,
+      allChoices: allChoices.length > 0 ? allChoices : ['default'],
+    };
+  }
+
+  normalizeAndValidateChoice(
+    request: ShowdownRequest,
+    requestedChoice: string | undefined | null
+  ): string {
+    return this.resolveChoiceForRequest(request, requestedChoice ?? '');
+  }
+
   private pickRecommendedMoves(
     moves: PokemonMoveItem[],
     context: {
@@ -598,42 +733,45 @@ export class BattleService {
     if (request.wait) return 'default';
 
     if (request.teamPreview) {
-      const normalized = requestedChoice?.trim() || 'team 1';
-      return /^team\s+\d+$/i.test(normalized) ? normalized : 'team 1';
-    }
-
-    if (request.forceSwitch?.[0]) {
-      const legalSwitches = this.getLegalSwitchChoices(request);
-      if (legalSwitches.length === 0) {
-        return 'default';
-      }
-
-      const normalized = requestedChoice?.trim();
-      if (normalized && legalSwitches.includes(normalized)) {
+      const sideCount = Math.max(1, request.side?.pokemon?.length ?? 6);
+      const fallback = `team ${Array.from(
+        { length: sideCount },
+        (_, index) => index + 1
+      ).join('')}`;
+      const normalized = requestedChoice?.trim() || fallback;
+      if (/^team\s+\d+$/i.test(normalized)) {
         return normalized;
       }
-      if (normalized && normalized !== 'default') {
+      if (normalized !== 'default') {
         throw new BadRequestException(
-          `Invalid forced switch choice "${normalized}". Legal choices: ${legalSwitches.join(', ')}`
+          `Invalid team preview choice "${normalized}". Expected "team <order>"`
         );
       }
-      return legalSwitches[0];
+      return fallback;
     }
 
-    const legalMoves = this.getLegalMoveChoices(request);
-    if (legalMoves.length > 0) {
-      const normalized = requestedChoice?.trim();
-      if (normalized && legalMoves.includes(normalized)) {
-        return normalized;
-      }
-      if (normalized && normalized !== 'default') {
-        throw new BadRequestException(
-          `Invalid move choice "${normalized}". Legal choices: ${legalMoves.join(', ')}`
-        );
-      }
-      return legalMoves[0];
+    const legalOptions = this.getLegalOptionsForRequest(request);
+    const normalized = requestedChoice?.trim();
+
+    if (normalized && legalOptions.allChoices.includes(normalized)) {
+      return normalized;
+    }
+    if (normalized && normalized !== 'default') {
+      const kind = legalOptions.forceSwitch ? 'forced switch' : 'action';
+      throw new BadRequestException(
+        `Invalid ${kind} choice "${normalized}". Legal choices: ${legalOptions.allChoices.join(', ')}`
+      );
     }
 
+    if (legalOptions.forceSwitch) {
+      return legalOptions.switchChoices[0] ?? 'default';
+    }
+    if (legalOptions.moveChoices.length > 0) {
+      return legalOptions.moveChoices[0];
+    }
+    if (legalOptions.switchChoices.length > 0) {
+      return legalOptions.switchChoices[0];
+    }
     return 'default';
   }
 
@@ -657,6 +795,60 @@ export class BattleService {
   private isFainted(pokemon: ShowdownRequestSidePokemon): boolean {
     if (pokemon.fainted) return true;
     return typeof pokemon.condition === 'string' && pokemon.condition.includes('fnt');
+  }
+
+  private normalizeTeamInputs(
+    team: StartBattleTeamInput[] | undefined,
+    maxSize: number
+  ): StartBattleTeamMemberInput[] {
+    const normalized = (team ?? [])
+      .map((member): StartBattleTeamMemberInput | null => {
+        if (typeof member === 'string') {
+          const species = member.trim();
+          return species ? { species } : null;
+        }
+
+        if (!member?.species || typeof member.species !== 'string') {
+          return null;
+        }
+        const species = member.species.trim();
+        if (!species) return null;
+        return {
+          species,
+          moves: Array.isArray(member.moves) ? member.moves : undefined,
+          level: typeof member.level === 'number' ? member.level : undefined,
+        };
+      })
+      .filter((member): member is StartBattleTeamMemberInput => !!member);
+    return normalized.slice(0, maxSize);
+  }
+
+  private async getDefaultSpeciesList(size: number, offset: number): Promise<string[]> {
+    const { Dex } = await import('pokemon-showdown');
+    const allSpecies = Dex.species
+      .all()
+      .filter((species: DexSpeciesLike) => {
+        if (!species?.exists || species.num <= 0) return false;
+        if (species.isNonstandard && species.isNonstandard !== null) return false;
+        if (species.battleOnly) return false;
+        return !!species.name;
+      })
+      .sort(
+        (a: DexSpeciesLike, b: DexSpeciesLike) =>
+          a.num - b.num || a.name.localeCompare(b.name)
+      );
+
+    if (allSpecies.length === 0) {
+      throw new BadRequestException('No legal species available for default team generation');
+    }
+
+    const selected: string[] = [];
+    let cursor = ((offset % allSpecies.length) + allSpecies.length) % allSpecies.length;
+    while (selected.length < size) {
+      selected.push(allSpecies[cursor].name);
+      cursor = (cursor + 1) % allSpecies.length;
+    }
+    return selected;
   }
 
   /**

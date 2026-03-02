@@ -5,15 +5,43 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import type { Battle } from 'pokemon-showdown';
-import { BattleService, StartBattleRequest } from './battle.service';
+import {
+  BattleService,
+  StartBattleRequest,
+  type ShowdownLegalOptions,
+  type ShowdownRequest,
+} from './battle.service';
 import {
   CpuMoveAiService,
   type CpuMoveDecisionResult,
 } from './cpu-move-ai.service';
-import type { ShowdownRequest } from './battle.service';
+
+export interface BattlePokemonState {
+  slot: number;
+  ident: string;
+  name: string;
+  hp: number;
+  maxHp: number;
+  hpPercent: number;
+  status: string | null;
+  fainted: boolean;
+  isActive: boolean;
+}
+
+export interface BattleSideState {
+  active: BattlePokemonState | null;
+  bench: BattlePokemonState[];
+  team: BattlePokemonState[];
+  faintedCount: number;
+}
 
 export interface BattleState {
   battleId: string;
+  sides: {
+    p1: BattleSideState;
+    p2: BattleSideState;
+  };
+  // Backward-compatible active snapshots.
   p1Pokemon: {
     name: string;
     hp: number;
@@ -29,32 +57,44 @@ export interface BattleState {
     status: string | null;
   };
   availableMoves: {
+    choice: string;
+    index: number;
     name: string;
     type: string;
     power: number | null;
     pp: number;
     maxPp: number;
   }[];
+  availableSwitches: {
+    choice: string;
+    slot: number;
+    name: string;
+    hpPercent: number;
+    status: string | null;
+    fainted: boolean;
+    isActive: boolean;
+  }[];
+  canSwitch: boolean;
   turnLog: string[];
   isEnded: boolean;
   winner: string | null;
   currentTurn: number;
   waitingForMove: boolean;
   pendingPlayers: ('p1' | 'p2')[];
-  phase: 'awaiting-moves' | 'resolving' | 'ended';
+  phase: 'team-preview' | 'awaiting-actions' | 'resolving' | 'ended';
   lastAction: {
     player: 'p1' | 'p2';
-    moveIndex: number;
-    moveName: string | null;
+    choice: string;
     acceptedAt: number;
   } | null;
   lastTurnEvents: BattleTurnEvent[];
   lastCpuDecision: {
-    moveIndex: number;
-    moveName: string | null;
+    choice: string;
+    actionType: 'move' | 'switch' | 'team' | 'default';
     source: 'model' | 'fallback';
     modelId: string;
     latencyMs: number;
+    reasoning?: string;
     rawResponse?: string;
     error?: string;
     turn: number;
@@ -65,6 +105,8 @@ export interface BattleTurnEvent {
   kind:
     | 'turn'
     | 'move'
+    | 'switch'
+    | 'drag'
     | 'damage'
     | 'heal'
     | 'status'
@@ -88,11 +130,11 @@ export interface BattleTurnEvent {
 class BattleSession {
   id: string;
   battle: Battle;
-  p1MoveChoice: string | null = null;
-  p2MoveChoice: string | null = null;
+  p1Choice: string | null = null;
+  p2Choice: string | null = null;
   turnLog: string[] = [];
   currentTurn = 0;
-  lastLogIndex = 0; // Track which logs we've already processed
+  lastLogIndex = 0;
   lastAction: BattleState['lastAction'] = null;
   lastTurnEvents: BattleTurnEvent[] = [];
   lastCpuDecision: BattleState['lastCpuDecision'] = null;
@@ -103,21 +145,21 @@ class BattleSession {
     this.battle = battle;
   }
 
-  hasP1Chosen(): boolean {
-    return this.p1MoveChoice !== null;
+  hasChoice(player: 'p1' | 'p2'): boolean {
+    return player === 'p1' ? this.p1Choice !== null : this.p2Choice !== null;
   }
 
-  hasP2Chosen(): boolean {
-    return this.p2MoveChoice !== null;
-  }
-
-  bothPlayersChosen(): boolean {
-    return this.hasP1Chosen() && this.hasP2Chosen();
+  setChoice(player: 'p1' | 'p2', choice: string): void {
+    if (player === 'p1') {
+      this.p1Choice = choice;
+      return;
+    }
+    this.p2Choice = choice;
   }
 
   clearChoices() {
-    this.p1MoveChoice = null;
-    this.p2MoveChoice = null;
+    this.p1Choice = null;
+    this.p2Choice = null;
   }
 }
 
@@ -131,50 +173,62 @@ export class BattleSessionManager {
   ) {}
 
   async createBattle(config?: StartBattleRequest): Promise<BattleState> {
-    const { Battle, Teams } = await import('pokemon-showdown');
+    const { Battle } = await import('pokemon-showdown');
 
-    const p1Built = await this.battleService.buildPokemonSet({
-      speciesName: config?.p1Pokemon ?? 'Gengar',
-      selectedMoves: config?.p1Moves,
-      level: config?.level,
+    const p1Built = await this.battleService.buildTeam({
+      team: config?.p1Team,
+      fallbackSpecies: config?.p1Pokemon,
+      fallbackMoves: config?.p1Moves,
+      fallbackLevel: config?.level,
+      defaultOffset: 0,
+      size: 6,
     });
-    const p2Built = await this.battleService.buildPokemonSet({
-      speciesName: config?.p2Pokemon ?? 'Charizard',
-      selectedMoves: config?.p2Moves,
-      level: config?.level,
+    const p2Built = await this.battleService.buildTeam({
+      team: config?.p2Team,
+      fallbackSpecies: config?.p2Pokemon,
+      fallbackMoves: config?.p2Moves,
+      fallbackLevel: config?.level,
+      defaultOffset: 30,
+      size: 6,
     });
-
-    const p1Team = Teams.pack([p1Built.set]);
-    const p2Team = Teams.pack([p2Built.set]);
 
     const battle = new Battle({
       formatid: config?.formatid ?? 'gen9customgame',
     });
 
     battle.setPlayer('p1', {
-      name: `Player 1 (${p1Built.speciesName})`,
-      team: p1Team,
+      name: `Player 1 (${p1Built.members[0]?.speciesName ?? 'Team'})`,
+      team: p1Built.packed,
     });
 
     battle.setPlayer('p2', {
-      name: `CPU (${p2Built.speciesName})`,
-      team: p2Team,
+      name: `CPU (${p2Built.members[0]?.speciesName ?? 'Team'})`,
+      team: p2Built.packed,
     });
 
-    // Handle team preview
-    battle.choose('p1', 'team 1');
-    battle.choose('p2', 'team 1');
+    battle.choose(
+      'p1',
+      this.normalizeTeamPreviewChoice(config?.p1TeamPreviewChoice, p1Built.members.length)
+    );
+    battle.choose(
+      'p2',
+      this.normalizeTeamPreviewChoice(config?.p2TeamPreviewChoice, p2Built.members.length)
+    );
 
     const battleId = `battle_${Date.now()}_${Math.random()
       .toString(36)
-      .substr(2, 9)}`;
+      .slice(2, 11)}`;
     const session = new BattleSession(battleId, battle);
 
-    // Set initial log index after team preview to skip setup logs
     session.lastLogIndex = battle.log.length;
+    session.currentTurn = (battle as unknown as { turn?: number }).turn ?? 0;
 
     this.sessions.set(battleId, session);
-    this.battleService.registerBattleSession(battleId, battle as never, session.lastLogIndex);
+    this.battleService.registerBattleSession(
+      battleId,
+      battle as never,
+      session.lastLogIndex
+    );
 
     return this.getBattleState(battleId);
   }
@@ -183,6 +237,18 @@ export class BattleSessionManager {
     battleId: string,
     player: 'p1' | 'p2',
     moveIndex: number
+  ): Promise<BattleState> {
+    if (!Number.isInteger(moveIndex)) {
+      throw new BadRequestException('moveIndex must be an integer');
+    }
+    const normalizedMoveIndex = moveIndex >= 1 ? moveIndex : moveIndex + 1;
+    return this.submitAction(battleId, player, `move ${normalizedMoveIndex}`);
+  }
+
+  async submitAction(
+    battleId: string,
+    player: 'p1' | 'p2',
+    choice: string
   ): Promise<BattleState> {
     const session = this.sessions.get(battleId);
     if (!session) {
@@ -199,103 +265,82 @@ export class BattleSessionManager {
       );
     }
 
-    const normalizedMoveIndex = this.normalizeMoveIndex(session, player, moveIndex);
-    const moveChoice = `move ${normalizedMoveIndex}`;
-    const moveName = this.getMoveName(session, player, normalizedMoveIndex);
+    const requests = this.battleService.getRequests(battleId);
+    const normalizedChoice = this.normalizePlayerChoice(
+      player,
+      player === 'p1' ? requests.p1 : requests.p2,
+      choice
+    );
 
-    if (player === 'p1') {
-      session.p1MoveChoice = moveChoice;
-    } else {
-      session.p2MoveChoice = moveChoice;
-    }
-
+    session.setChoice(player, normalizedChoice);
     session.lastAction = {
       player,
-      moveIndex: normalizedMoveIndex,
-      moveName,
+      choice: normalizedChoice,
       acceptedAt: Date.now(),
     };
 
     try {
-      if (player === 'p1' && this.isCpuAiEnabled() && !session.hasP2Chosen()) {
+      if (player === 'p1' && !session.hasChoice('p2')) {
         session.isResolving = true;
-        await this.tryChooseCpuMove(session);
+        await this.tryChooseCpuAction(session, requests);
       }
 
-      // If both players have chosen, process the turn
-      if (session.bothPlayersChosen()) {
+      this.autofillNonActionableChoices(session, requests);
+
+      if (this.isReadyToResolve(session, requests)) {
         session.isResolving = true;
-        return await this.processTurn(battleId);
+        return await this.processTurn(battleId, requests);
       }
 
       return this.getBattleState(battleId);
     } finally {
-      // Keep locked only if both choices remain queued and caller should not re-submit.
-      // In normal completion paths processTurn clears choices, so unlock.
-      if (!session.bothPlayersChosen()) {
-        session.isResolving = false;
+      if (session.isResolving) {
+        const latestRequests = this.battleService.getRequests(battleId);
+        if (!this.isReadyToResolve(session, latestRequests)) {
+          session.isResolving = false;
+        }
       }
     }
   }
 
-  private async processTurn(battleId: string): Promise<BattleState> {
+  private async processTurn(
+    battleId: string,
+    requests: { p1: ShowdownRequest; p2: ShowdownRequest }
+  ): Promise<BattleState> {
     const session = this.sessions.get(battleId);
     if (!session) {
       throw new NotFoundException('Battle not found');
     }
 
-    const { battle } = session;
+    const p1Choice =
+      session.p1Choice ?? this.pickDefaultChoice(this.battleService.getLegalOptionsForRequest(requests.p1));
+    const p2Choice =
+      session.p2Choice ?? this.pickDefaultChoice(this.battleService.getLegalOptionsForRequest(requests.p2));
 
-    // Submit both choices for the same turn; Showdown resolves order and
-    // handles request types (move/switch/default) internally.
     try {
-      const p1Choice = session.p1MoveChoice;
-      const p2Choice = session.p2MoveChoice;
-      if (!p1Choice || !p2Choice) {
-        throw new BadRequestException('Missing choices for one or both players');
-      }
+      const stepResult = this.battleService.step(battleId, p1Choice, p2Choice);
+      const newLogs = stepResult.rawLogDelta;
+      const formattedNewLogs = this.formatRecentLog(newLogs);
 
-      this.battleService.step(battleId, p1Choice, p2Choice);
+      session.lastTurnEvents = this.buildTurnEvents(newLogs);
+      session.turnLog.push(...formattedNewLogs);
+      session.lastLogIndex = session.battle.log.length;
+      session.currentTurn =
+        (session.battle as unknown as { turn?: number }).turn ??
+        session.currentTurn + 1;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
-      if (message.includes('Invalid move choice')) {
-        // Recharge / lock / forced-choice edge cases can make a previously
-        // prepared CPU move invalid by the time we submit. Let Showdown auto-resolve.
-        try {
-          const p1Choice = session.p1MoveChoice;
-          if (p1Choice) {
-            this.battleService.step(battleId, p1Choice, 'default');
-          }
-        } catch {
-          // Fall through to standard error handling below.
-        }
-      }
       if (message.includes('Not all choices done')) {
         session.clearChoices();
         session.isResolving = false;
         return this.getBattleState(battleId);
       }
 
-      // Clear choices on other errors to prevent stuck state
       session.clearChoices();
       session.isResolving = false;
       throw error;
     }
 
-    // Capture NEW logs since last turn
-    const newLogs = battle.log.slice(session.lastLogIndex);
-    const formattedNewLogs = this.formatRecentLog(newLogs);
-    session.lastTurnEvents = this.buildTurnEvents(newLogs);
-
-    // Append new logs to the session's turn log
-    session.turnLog.push(...formattedNewLogs);
-
-    // Update the last log index
-    session.lastLogIndex = battle.log.length;
-
-    session.currentTurn = (battle as unknown as { turn?: number }).turn ?? session.currentTurn + 1;
-
-    // Clear choices after successful submission
     session.clearChoices();
     session.isResolving = false;
 
@@ -309,67 +354,73 @@ export class BattleSessionManager {
     }
 
     const { battle } = session;
-    const p1Side = battle.sides[0];
-    const p2Side = battle.sides[1];
+    const requests = this.battleService.getRequests(battleId);
+    const p1Legal = this.battleService.getLegalOptionsForRequest(requests.p1);
+    const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
 
-    const p1Active = p1Side?.active?.[0];
-    const p2Active = p2Side?.active?.[0];
-    const p1RequestState = p1Side?.requestState;
-    const p2RequestState = p2Side?.requestState;
+    const p1Side = this.buildSideState(
+      battle.sides?.[0] as unknown as BattleSideLike,
+      requests.p1
+    );
+    const p2Side = this.buildSideState(
+      battle.sides?.[1] as unknown as BattleSideLike,
+      requests.p2
+    );
 
-    // Get available moves for p1
-    const availableMoves =
-      p1Active?.moveSlots?.map((move: { id?: string; move: string; pp: number; maxpp: number }) => {
-        const battleWithDex = battle as unknown as {
-          dex?: { moves?: { get?: (idOrName: string) => { type?: string; basePower?: number } | undefined } };
-        };
-        const dexMove = battleWithDex.dex?.moves?.get?.(move.id || move.move);
-        return {
-          name: move.move,
-          type: dexMove?.type || 'Normal',
-          power: typeof dexMove?.basePower === 'number' && dexMove.basePower > 0
-            ? dexMove.basePower
-            : null,
-          pp: move.pp,
-          maxPp: move.maxpp,
-        };
-      }) || [];
+    const availableMoves = this.buildAvailableMoves(
+      requests.p1,
+      p1Legal,
+      battle as unknown as BattleWithDex
+    );
+    const availableSwitches = this.buildAvailableSwitches(p1Side, p1Legal);
 
-    // Return accumulated turn logs from the session
     const pendingPlayers: ('p1' | 'p2')[] = [];
-    if (p1RequestState === 'move' && !session.hasP1Chosen()) pendingPlayers.push('p1');
-    if (p2RequestState === 'move' && !session.hasP2Chosen()) pendingPlayers.push('p2');
+    if (this.playerNeedsChoice('p1', p1Legal) && !session.hasChoice('p1')) {
+      pendingPlayers.push('p1');
+    }
+    if (this.playerNeedsChoice('p2', p2Legal) && !session.hasChoice('p2')) {
+      pendingPlayers.push('p2');
+    }
 
     const phase: BattleState['phase'] = battle.ended
       ? 'ended'
-      : session.bothPlayersChosen()
-        ? 'resolving'
+      : p1Legal.teamPreview || p2Legal.teamPreview
+        ? 'team-preview'
         : session.isResolving
           ? 'resolving'
-        : 'awaiting-moves';
+          : 'awaiting-actions';
 
     return {
       battleId,
+      sides: {
+        p1: p1Side,
+        p2: p2Side,
+      },
       p1Pokemon: {
-        name: p1Active?.name || 'Unknown',
-        hp: p1Active?.hp || 0,
-        maxHp: p1Active?.maxhp || 100,
-        hpPercent: this.toHpPercent(p1Active?.hp, p1Active?.maxhp),
-        status: p1Active?.status || null,
+        name: p1Side.active?.name || 'Unknown',
+        hp: p1Side.active?.hp || 0,
+        maxHp: p1Side.active?.maxHp || 100,
+        hpPercent: p1Side.active?.hpPercent || 0,
+        status: p1Side.active?.status || null,
       },
       p2Pokemon: {
-        name: p2Active?.name || 'Unknown',
-        hp: p2Active?.hp || 0,
-        maxHp: p2Active?.maxhp || 100,
-        hpPercent: this.toHpPercent(p2Active?.hp, p2Active?.maxhp),
-        status: p2Active?.status || null,
+        name: p2Side.active?.name || 'Unknown',
+        hp: p2Side.active?.hp || 0,
+        maxHp: p2Side.active?.maxHp || 100,
+        hpPercent: p2Side.active?.hpPercent || 0,
+        status: p2Side.active?.status || null,
       },
       availableMoves,
-      turnLog: session.turnLog, // Return accumulated logs instead of re-formatting
+      availableSwitches,
+      canSwitch: availableSwitches.length > 0,
+      turnLog: session.turnLog,
       isEnded: battle.ended,
       winner: battle.winner || null,
       currentTurn: session.currentTurn,
-      waitingForMove: p1RequestState === 'move' && !session.hasP1Chosen(),
+      waitingForMove:
+        p1Legal.moveChoices.length > 0 &&
+        !p1Legal.forceSwitch &&
+        pendingPlayers.includes('p1'),
       pendingPlayers,
       phase,
       lastAction: session.lastAction,
@@ -378,87 +429,544 @@ export class BattleSessionManager {
     };
   }
 
-  private normalizeMoveIndex(
-    session: BattleSession,
-    player: 'p1' | 'p2',
-    moveIndex: number
-  ): number {
-    if (!Number.isInteger(moveIndex)) {
-      throw new BadRequestException('moveIndex must be an integer');
-    }
+  deleteBattle(battleId: string) {
+    this.sessions.delete(battleId);
+    this.battleService.unregisterBattleSession(battleId);
+  }
 
-    const sideIndex = player === 'p1' ? 0 : 1;
-    const requestState = session.battle.sides[sideIndex]?.requestState;
-    if (requestState !== 'move') {
-      throw new BadRequestException(
-        `${player} is not currently allowed to choose a move`
-      );
-    }
+  private normalizeTeamPreviewChoice(choice: string | undefined, teamSize: number): string {
+    const fallback = `team ${Array.from(
+      { length: Math.max(1, Math.min(6, teamSize || 6)) },
+      (_, index) => index + 1
+    ).join('')}`;
 
-    const active = session.battle.sides[sideIndex]?.active?.[0] as
-      | { moveSlots?: Array<{ move: string; disabled?: boolean }> }
-      | undefined;
-    const moveSlots = active?.moveSlots ?? [];
-    if (moveSlots.length === 0) {
-      throw new BadRequestException('No moves available for active Pokemon');
-    }
-
-    const normalized = moveIndex >= 1 ? moveIndex : moveIndex + 1;
-    if (normalized < 1 || normalized > moveSlots.length) {
-      throw new BadRequestException(
-        `moveIndex out of range. Expected 0-${moveSlots.length - 1} or 1-${moveSlots.length}`
-      );
-    }
-
-    const selected = moveSlots[normalized - 1];
-    if (selected?.disabled) {
-      throw new BadRequestException(`${selected.move} is currently disabled`);
-    }
-
-    // Align validation with BattleService.step(), which uses the latest
-    // Showdown request JSON (this can differ from moveSlots during recharge/locks).
-    try {
-      const requests = this.battleService.getRequests(session.id);
-      const request = player === 'p1' ? requests.p1 : requests.p2;
-      const legalMoveChoices = this.getLegalMoveChoicesFromRequest(request);
-      if (legalMoveChoices.length > 0) {
-        const requestedChoice = `move ${normalized}`;
-        if (!legalMoveChoices.includes(requestedChoice)) {
-          // If Showdown only allows one move (common for recharge/locks), auto-coerce.
-          if (legalMoveChoices.length === 1) {
-            const onlyLegal = legalMoveChoices[0];
-            const match = onlyLegal.match(/^move\s+(\d+)$/i);
-            if (match) {
-              return Number(match[1]);
-            }
-          }
-
-          throw new BadRequestException(
-            `Invalid move choice "${requestedChoice}". Legal choices: ${legalMoveChoices.join(', ')}`
-          );
-        }
-      }
-    } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-      // Ignore request lookup issues and fall back to moveSlots validation.
-    }
-
+    if (!choice?.trim()) return fallback;
+    const normalized = choice.trim();
+    if (!/^team\s+\d+$/i.test(normalized)) return fallback;
     return normalized;
   }
 
-  private getMoveName(
-    session: BattleSession,
+  private normalizePlayerChoice(
     player: 'p1' | 'p2',
-    moveIndex: number
-  ): string | null {
-    const sideIndex = player === 'p1' ? 0 : 1;
-    const active = session.battle.sides[sideIndex]?.active?.[0] as
-      | { moveSlots?: Array<{ move: string }> }
-      | undefined;
+    request: ShowdownRequest,
+    choice: string
+  ): string {
+    const legal = this.battleService.getLegalOptionsForRequest(request);
+    if (!legal.needsChoice) {
+      return 'default';
+    }
 
-    return active?.moveSlots?.[moveIndex - 1]?.move ?? null;
+    const normalized = (choice || '').trim();
+    if (!normalized || normalized === 'default') {
+      return this.pickDefaultChoice(legal);
+    }
+
+    if (legal.teamPreview) {
+      if (/^team\s+\d+$/i.test(normalized)) {
+        return normalized;
+      }
+      throw new BadRequestException({
+        message: `Illegal action "${normalized}" for ${player}`,
+        legalOptions: legal.allChoices,
+      });
+    }
+
+    if (legal.allChoices.includes(normalized)) {
+      return normalized;
+    }
+
+    throw new BadRequestException({
+      message: `Illegal action "${normalized}" for ${player}`,
+      legalOptions: legal.allChoices,
+      forceSwitch: legal.forceSwitch,
+      moveChoices: legal.moveChoices,
+      switchChoices: legal.switchChoices,
+    });
+  }
+
+  private pickDefaultChoice(legal: ShowdownLegalOptions): string {
+    if (!legal.needsChoice || legal.wait) return 'default';
+    if (legal.teamPreview) {
+      return legal.allChoices[0] ?? 'team 123456';
+    }
+    if (legal.forceSwitch) {
+      return legal.switchChoices[0] ?? 'default';
+    }
+    if (legal.moveChoices.length > 0) {
+      return legal.moveChoices[0];
+    }
+    if (legal.switchChoices.length > 0) {
+      return legal.switchChoices[0];
+    }
+    return 'default';
+  }
+
+  private playerNeedsChoice(player: 'p1' | 'p2', legal: ShowdownLegalOptions): boolean {
+    if (!legal.needsChoice || legal.wait) return false;
+    if (player === 'p2' && !legal.allChoices.length) return false;
+    return true;
+  }
+
+  private autofillNonActionableChoices(
+    session: BattleSession,
+    requests: { p1: ShowdownRequest; p2: ShowdownRequest }
+  ): void {
+    const p1Legal = this.battleService.getLegalOptionsForRequest(requests.p1);
+    if (!this.playerNeedsChoice('p1', p1Legal) && !session.hasChoice('p1')) {
+      session.setChoice('p1', 'default');
+    }
+
+    const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
+    if (!this.playerNeedsChoice('p2', p2Legal) && !session.hasChoice('p2')) {
+      session.setChoice('p2', 'default');
+    }
+  }
+
+  private isReadyToResolve(
+    session: BattleSession,
+    requests: { p1: ShowdownRequest; p2: ShowdownRequest }
+  ): boolean {
+    const p1Legal = this.battleService.getLegalOptionsForRequest(requests.p1);
+    const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
+
+    const p1Ready = !this.playerNeedsChoice('p1', p1Legal) || session.hasChoice('p1');
+    const p2Ready = !this.playerNeedsChoice('p2', p2Legal) || session.hasChoice('p2');
+    return p1Ready && p2Ready;
+  }
+
+  private async tryChooseCpuAction(
+    session: BattleSession,
+    requests: { p1: ShowdownRequest; p2: ShowdownRequest }
+  ): Promise<void> {
+    const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
+    if (!p2Legal.needsChoice || p2Legal.wait) {
+      session.setChoice('p2', 'default');
+      return;
+    }
+
+    if (p2Legal.teamPreview) {
+      const teamChoice = this.pickDefaultChoice(p2Legal);
+      session.setChoice('p2', teamChoice);
+      session.lastCpuDecision = {
+        choice: teamChoice,
+        actionType: 'team',
+        source: 'fallback',
+        modelId: this.cpuMoveAiService.getDefaultModelId(),
+        latencyMs: 0,
+        reasoning: 'Deterministic team preview order',
+        turn: session.currentTurn,
+      };
+      return;
+    }
+
+    if (p2Legal.forceSwitch || (p2Legal.switchChoices.length > 0 && p2Legal.moveChoices.length === 0)) {
+      const selectedSwitch = this.chooseBestSwitch(requests.p2, p2Legal.switchChoices);
+      session.setChoice('p2', selectedSwitch);
+      session.lastCpuDecision = {
+        choice: selectedSwitch,
+        actionType: 'switch',
+        source: 'fallback',
+        modelId: this.cpuMoveAiService.getDefaultModelId(),
+        latencyMs: 0,
+        reasoning: 'Selected highest remaining HP switch target',
+        turn: session.currentTurn + 1,
+      };
+      return;
+    }
+
+    if (p2Legal.moveChoices.length > 0) {
+      await this.chooseCpuMoveAction(session, requests, p2Legal);
+      return;
+    }
+
+    const defaultChoice = this.pickDefaultChoice(p2Legal);
+    session.setChoice('p2', defaultChoice);
+    session.lastCpuDecision = {
+      choice: defaultChoice,
+      actionType: 'default',
+      source: 'fallback',
+      modelId: this.cpuMoveAiService.getDefaultModelId(),
+      latencyMs: 0,
+      reasoning: 'Default action selected',
+      turn: session.currentTurn + 1,
+    };
+  }
+
+  private async chooseCpuMoveAction(
+    session: BattleSession,
+    requests: { p1: ShowdownRequest; p2: ShowdownRequest },
+    p2Legal: ShowdownLegalOptions
+  ): Promise<void> {
+    const battle = session.battle as unknown as BattleWithDex;
+    const p1Active = battle.sides?.[0]?.active?.[0];
+    const p2Active = battle.sides?.[1]?.active?.[0];
+
+    const moveRequests = requests.p2.active?.[0]?.moves ?? [];
+    const legalMoveIndices = new Set(
+      p2Legal.moveChoices
+        .map((choice) => {
+          const match = choice.match(/^move\s+(\d+)$/i);
+          return match ? Number(match[1]) : null;
+        })
+        .filter((index): index is number => typeof index === 'number')
+    );
+
+    const p2MoveChoices = moveRequests
+      .map((move, index) => ({ move, index: index + 1 }))
+      .filter(({ index, move }) => legalMoveIndices.has(index) && (move.pp ?? 1) > 0 && !move.disabled)
+      .map(({ move, index }) => {
+        const dexMove = battle.dex?.moves?.get?.(move.id || move.move);
+        const moveType = dexMove?.type;
+        const isImmune =
+          !!moveType &&
+          !!p1Active &&
+          !!battle.dex?.getImmunity &&
+          !battle.dex.getImmunity(moveType, p1Active);
+        const typeMod =
+          !!moveType && !!p1Active && !!battle.dex?.getEffectiveness
+            ? battle.dex.getEffectiveness(moveType, p1Active)
+            : 0;
+
+        return {
+          index,
+          name: move.move,
+          type: dexMove?.type,
+          power:
+            typeof dexMove?.basePower === 'number' && dexMove.basePower > 0
+              ? dexMove.basePower
+              : null,
+          pp: move.pp,
+          effectivenessMultiplier:
+            isImmune || typeof typeMod !== 'number' ? 0 : Math.pow(2, typeMod),
+          isImmune,
+        };
+      });
+
+    if (p2MoveChoices.length === 0) {
+      const fallbackChoice = this.pickDefaultChoice(p2Legal);
+      session.setChoice('p2', fallbackChoice);
+      return;
+    }
+
+    const deterministicFallback = this.pickDeterministicMoveIndex(p2MoveChoices);
+
+    let decision: CpuMoveDecisionResult;
+    if (this.isCpuAiEnabled()) {
+      decision = await this.safeChooseCpuMove(session, p2MoveChoices, {
+        cpuPokemonName: p2Active?.name || 'Unknown',
+        playerPokemonName: p1Active?.name || 'Unknown',
+      });
+    } else {
+      decision = {
+        moveIndex: deterministicFallback,
+        source: 'fallback',
+        modelId: this.cpuMoveAiService.getDefaultModelId(),
+        latencyMs: 0,
+        reasoning: 'Deterministic fallback move',
+      };
+    }
+
+    const selected =
+      p2MoveChoices.find((move) => move.index === decision.moveIndex) ||
+      p2MoveChoices.find((move) => move.index === deterministicFallback) ||
+      p2MoveChoices[0];
+    const finalChoice = `move ${selected.index}`;
+
+    session.setChoice('p2', finalChoice);
+    session.lastCpuDecision = {
+      choice: finalChoice,
+      actionType: 'move',
+      source: decision.source,
+      modelId: decision.modelId,
+      latencyMs: decision.latencyMs,
+      reasoning: decision.reasoning,
+      rawResponse: decision.rawResponse,
+      error: decision.error,
+      turn: session.currentTurn + 1,
+    };
+  }
+
+  private chooseBestSwitch(request: ShowdownRequest, legalSwitchChoices: string[]): string {
+    if (legalSwitchChoices.length <= 1) {
+      return legalSwitchChoices[0] ?? 'default';
+    }
+
+    const legalSlots = new Set(
+      legalSwitchChoices
+        .map((choice) => {
+          const match = choice.match(/^switch\s+(\d+)$/i);
+          return match ? Number(match[1]) : null;
+        })
+        .filter((slot): slot is number => typeof slot === 'number')
+    );
+
+    const party = request.side?.pokemon ?? [];
+    const candidates = party
+      .map((pokemon, index) => ({ pokemon, slot: index + 1 }))
+      .filter(({ slot }) => legalSlots.has(slot))
+      .map(({ pokemon, slot }) => {
+        const parsed = this.parseCondition(pokemon.condition);
+        return {
+          slot,
+          hpPercent: parsed.hpPercent,
+          status: parsed.status,
+        };
+      })
+      .sort((a, b) => {
+        if (b.hpPercent !== a.hpPercent) return b.hpPercent - a.hpPercent;
+        if (a.status && !b.status) return 1;
+        if (!a.status && b.status) return -1;
+        return a.slot - b.slot;
+      });
+
+    if (candidates.length === 0) {
+      return legalSwitchChoices[0];
+    }
+    return `switch ${candidates[0].slot}`;
+  }
+
+  private pickDeterministicMoveIndex(
+    choices: Array<{
+      index: number;
+      power?: number | null;
+      pp?: number;
+      effectivenessMultiplier?: number;
+      isImmune?: boolean;
+    }>
+  ): number {
+    const nonImmune = choices.filter((choice) => !choice.isImmune);
+    const pool = nonImmune.length > 0 ? nonImmune : choices;
+
+    const sorted = [...pool].sort((a, b) => {
+      const effA = a.effectivenessMultiplier ?? 1;
+      const effB = b.effectivenessMultiplier ?? 1;
+      if (effB !== effA) return effB - effA;
+      const powA = a.power ?? 0;
+      const powB = b.power ?? 0;
+      if (powB !== powA) return powB - powA;
+      const ppA = a.pp ?? 0;
+      const ppB = b.pp ?? 0;
+      if (ppB !== ppA) return ppB - ppA;
+      return a.index - b.index;
+    });
+
+    return sorted[0].index;
+  }
+
+  private isCpuAiEnabled(): boolean {
+    return process.env.ENABLE_CPU_AI === 'true';
+  }
+
+  private async safeChooseCpuMove(
+    session: BattleSession,
+    p2MoveChoices: Array<{
+      index: number;
+      name: string;
+      type?: string;
+      power?: number | null;
+      pp?: number;
+      effectivenessMultiplier?: number;
+      isImmune?: boolean;
+    }>,
+    names: { cpuPokemonName: string; playerPokemonName: string }
+  ): Promise<CpuMoveDecisionResult> {
+    try {
+      return await this.cpuMoveAiService.chooseCpuMove({
+        battleId: session.id,
+        turn: session.currentTurn + 1,
+        cpuPokemonName: names.cpuPokemonName,
+        playerPokemonName: names.playerPokemonName,
+        availableMoves: p2MoveChoices,
+        recentLog: session.turnLog.slice(-4),
+        cpuPokemonTypes: this.getPokemonTypes(session.battle.sides[1]?.active?.[0]),
+        playerPokemonTypes: this.getPokemonTypes(session.battle.sides[0]?.active?.[0]),
+      });
+    } catch (error) {
+      if (process.env.OPENAI_CPU_STRICT === 'true') {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      const fallbackMoveIndex = this.pickDeterministicMoveIndex(p2MoveChoices);
+      return {
+        moveIndex: fallbackMoveIndex,
+        source: 'fallback',
+        modelId: process.env.OPENAI_CPU_MODEL || 'gpt-4.1-mini',
+        latencyMs: 0,
+        error: message,
+      };
+    }
+  }
+
+  private getPokemonTypes(pokemon: unknown): string[] | undefined {
+    const p = pokemon as { types?: string[]; getTypes?: () => string[] } | undefined;
+    if (!p) return undefined;
+    if (Array.isArray(p.types) && p.types.length > 0) return p.types;
+    try {
+      const types = p.getTypes?.();
+      return Array.isArray(types) ? types : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private buildSideState(side: BattleSideLike | undefined, request: ShowdownRequest): BattleSideState {
+    const source = side?.pokemon?.length
+      ? side.pokemon.map((pokemon) => ({
+          ident: pokemon.fullname || pokemon.name || `slot-${(pokemon.position ?? 0) + 1}`,
+          name: pokemon.name || pokemon.species?.name || 'Unknown',
+          slot: (pokemon.position ?? 0) + 1,
+          hp: typeof pokemon.hp === 'number' ? pokemon.hp : 0,
+          maxHp: typeof pokemon.maxhp === 'number' ? pokemon.maxhp : 0,
+          status: pokemon.status || null,
+          fainted: !!pokemon.fainted,
+          isActive: !!pokemon.isActive,
+        }))
+      : this.buildTeamFromRequest(request);
+
+    const team = source
+      .map((pokemon) => ({
+        ...pokemon,
+        hpPercent: this.toHpPercent(pokemon.hp, pokemon.maxHp),
+      }))
+      .sort((a, b) => a.slot - b.slot);
+
+    const active = team.find((pokemon) => pokemon.isActive) ?? null;
+    const bench = team.filter((pokemon) => !pokemon.isActive);
+
+    return {
+      active,
+      bench,
+      team,
+      faintedCount: team.filter((pokemon) => pokemon.fainted).length,
+    };
+  }
+
+  private buildTeamFromRequest(request: ShowdownRequest): Array<
+    Omit<BattlePokemonState, 'hpPercent'>
+  > {
+    return (request.side?.pokemon ?? []).map((pokemon, index) => {
+      const parsed = this.parseCondition(pokemon.condition);
+      return {
+        slot: index + 1,
+        ident: pokemon.ident || `slot-${index + 1}`,
+        name: this.extractNameFromIdent(pokemon.ident, pokemon.details),
+        hp: parsed.hp,
+        maxHp: parsed.maxHp,
+        status: parsed.status,
+        fainted: parsed.fainted,
+        isActive: !!pokemon.active,
+      };
+    });
+  }
+
+  private buildAvailableMoves(
+    request: ShowdownRequest,
+    legal: ShowdownLegalOptions,
+    battle: BattleWithDex
+  ): BattleState['availableMoves'] {
+    const legalIndices = new Set(
+      legal.moveChoices
+        .map((choice) => {
+          const match = choice.match(/^move\s+(\d+)$/i);
+          return match ? Number(match[1]) : null;
+        })
+        .filter((index): index is number => typeof index === 'number')
+    );
+
+    const moves = request.active?.[0]?.moves ?? [];
+    return moves
+      .map((move, index) => ({ move, index: index + 1 }))
+      .filter(({ index }) => legalIndices.has(index))
+      .map(({ move, index }) => {
+        const dexMove = battle.dex?.moves?.get?.(move.id || move.move);
+        return {
+          choice: `move ${index}`,
+          index,
+          name: move.move,
+          type: dexMove?.type || 'Normal',
+          power:
+            typeof dexMove?.basePower === 'number' && dexMove.basePower > 0
+              ? dexMove.basePower
+              : null,
+          pp: move.pp ?? 0,
+          maxPp: battle.sides?.[0]?.active?.[0]?.moveSlots?.[index - 1]?.maxpp ??
+            move.pp ??
+            0,
+        };
+      });
+  }
+
+  private buildAvailableSwitches(
+    side: BattleSideState,
+    legal: ShowdownLegalOptions
+  ): BattleState['availableSwitches'] {
+    const legalSlots = new Set(
+      legal.switchChoices
+        .map((choice) => {
+          const match = choice.match(/^switch\s+(\d+)$/i);
+          return match ? Number(match[1]) : null;
+        })
+        .filter((slot): slot is number => typeof slot === 'number')
+    );
+
+    return side.team
+      .filter((pokemon) => legalSlots.has(pokemon.slot))
+      .map((pokemon) => ({
+        choice: `switch ${pokemon.slot}`,
+        slot: pokemon.slot,
+        name: pokemon.name,
+        hpPercent: pokemon.hpPercent,
+        status: pokemon.status,
+        fainted: pokemon.fainted,
+        isActive: pokemon.isActive,
+      }));
+  }
+
+  private parseCondition(condition?: string): {
+    hp: number;
+    maxHp: number;
+    hpPercent: number;
+    status: string | null;
+    fainted: boolean;
+  } {
+    if (!condition) {
+      return { hp: 0, maxHp: 0, hpPercent: 0, status: null, fainted: false };
+    }
+
+    if (condition.includes('fnt')) {
+      return { hp: 0, maxHp: 0, hpPercent: 0, status: null, fainted: true };
+    }
+
+    const fractionMatch = condition.match(/(\d+)\/(\d+)/);
+    const statusMatch = condition.match(/\b(brn|psn|tox|par|slp|frz)\b/);
+    if (!fractionMatch) {
+      return { hp: 0, maxHp: 0, hpPercent: 0, status: statusMatch?.[1] ?? null, fainted: false };
+    }
+
+    const hp = Number(fractionMatch[1]);
+    const maxHp = Number(fractionMatch[2]);
+    return {
+      hp,
+      maxHp,
+      hpPercent: this.toHpPercent(hp, maxHp),
+      status: statusMatch?.[1] ?? null,
+      fainted: false,
+    };
+  }
+
+  private extractNameFromIdent(ident?: string, details?: string): string {
+    if (ident && ident.includes(':')) {
+      return ident.split(':')[1].trim();
+    }
+    if (details) {
+      return details.split(',')[0].trim();
+    }
+    return 'Unknown';
+  }
+
+  private toHpPercent(hp?: number, maxHp?: number): number {
+    if (!maxHp || maxHp <= 0 || typeof hp !== 'number') return 0;
+    return Math.max(0, Math.min(100, Math.round((hp / maxHp) * 100)));
   }
 
   private formatRecentLog(logs: string[]): string[] {
@@ -472,22 +980,30 @@ export class BattleSessionManager {
       const cmd = parts[0];
 
       switch (cmd) {
+        case 'switch':
+        case 'drag': {
+          const pokemon = parts[1]?.split(':')[1]?.trim();
+          if (pokemon) {
+            const verb = cmd === 'switch' ? 'switched in' : 'was dragged in';
+            formatted.push(`${pokemon} ${verb}.`);
+          }
+          break;
+        }
         case 'move':
-          formatted.push(
-            `${parts[1]?.split(':')[1]?.trim()} used ${parts[2]}!`
-          );
+          formatted.push(`${parts[1]?.split(':')[1]?.trim()} used ${parts[2]}!`);
           break;
         case '-damage': {
           const pokemon = parts[1]?.split(':')[1]?.trim();
           if (parts[2]?.includes('faint')) {
             formatted.push(`${pokemon} fainted!`);
           } else {
-            // Log HP changes
-            const hpInfo = parts[2]?.split('/');
-            if (hpInfo) {
-              formatted.push(`${pokemon} HP: ${parts[2]}`);
-            }
+            formatted.push(`${pokemon} HP: ${parts[2]}`);
           }
+          break;
+        }
+        case '-heal': {
+          const pokemon = parts[1]?.split(':')[1]?.trim();
+          formatted.push(`${pokemon} recovered HP (${parts[2]}).`);
           break;
         }
         case '-supereffective':
@@ -525,19 +1041,14 @@ export class BattleSessionManager {
           }
           break;
         }
+        case 'faint': {
+          const target = parts[1]?.split(':')[1]?.trim();
+          formatted.push(`${target} fainted!`);
+          break;
+        }
       }
     }
     return formatted;
-  }
-
-  deleteBattle(battleId: string) {
-    this.sessions.delete(battleId);
-    this.battleService.unregisterBattleSession(battleId);
-  }
-
-  private toHpPercent(hp?: number, maxHp?: number): number {
-    if (!maxHp || maxHp <= 0 || typeof hp !== 'number') return 0;
-    return Math.max(0, Math.min(100, Math.round((hp / maxHp) * 100)));
   }
 
   private buildTurnEvents(logs: string[]): BattleTurnEvent[] {
@@ -551,11 +1062,18 @@ export class BattleSessionManager {
       const cmd = parts[0];
       switch (cmd) {
         case 'turn':
-          events.push({
-            kind: 'turn',
-            text: `Turn ${parts[1]}`,
-          });
+          events.push({ kind: 'turn', text: `Turn ${parts[1]}` });
           break;
+        case 'switch': {
+          const actor = parts[1]?.split(':')[1]?.trim();
+          events.push({ kind: 'switch', text: `${actor} switched in.`, actor });
+          break;
+        }
+        case 'drag': {
+          const target = parts[1]?.split(':')[1]?.trim();
+          events.push({ kind: 'drag', text: `${target} was dragged out.`, target });
+          break;
+        }
         case 'move': {
           const actor = parts[1]?.split(':')[1]?.trim();
           const moveName = parts[2];
@@ -574,7 +1092,9 @@ export class BattleSessionManager {
           const parsed = this.parseHpProtocolPercent(hpState);
           events.push({
             kind: 'damage',
-            text: parsed.fainted ? `${target} fainted!` : `${target} HP ${parsed.hpPercent}%`,
+            text: parsed.fainted
+              ? `${target} fainted!`
+              : `${target} HP ${parsed.hpPercent}%`,
             target,
             hpPercent: parsed.hpPercent ?? undefined,
             status: parsed.status,
@@ -586,7 +1106,10 @@ export class BattleSessionManager {
           const parsed = this.parseHpProtocolPercent(parts[2] || '');
           events.push({
             kind: 'heal',
-            text: parsed.hpPercent !== null ? `${target} healed to ${parsed.hpPercent}%` : `${target} healed!`,
+            text:
+              parsed.hpPercent !== null
+                ? `${target} healed to ${parsed.hpPercent}%`
+                : `${target} healed!`,
             target,
             hpPercent: parsed.hpPercent ?? undefined,
             status: parsed.status,
@@ -662,11 +1185,20 @@ export class BattleSessionManager {
         }
         case 'faint': {
           const target = parts[1]?.split(':')[1]?.trim();
-          events.push({ kind: 'faint', text: `${target} fainted!`, target, hpPercent: 0 });
+          events.push({
+            kind: 'faint',
+            text: `${target} fainted!`,
+            target,
+            hpPercent: 0,
+          });
           break;
         }
         case 'win':
-          events.push({ kind: 'win', text: `${parts[1]} won the battle!`, actor: parts[1] });
+          events.push({
+            kind: 'win',
+            text: `${parts[1]} won the battle!`,
+            actor: parts[1],
+          });
           break;
       }
     }
@@ -712,158 +1244,39 @@ export class BattleSessionManager {
     const current = Number(fractionMatch[1]);
     const max = Number(fractionMatch[2]);
     return {
-      hpPercent: max > 0 ? Math.max(0, Math.min(100, Math.round((current / max) * 100))) : null,
+      hpPercent:
+        max > 0
+          ? Math.max(0, Math.min(100, Math.round((current / max) * 100)))
+          : null,
       status: statusMatch?.[1] ?? null,
       fainted: false,
     };
   }
+}
 
-  private isCpuAiEnabled(): boolean {
-    return process.env.ENABLE_CPU_AI === 'true';
-  }
+interface BattleSideLike {
+  active?: Array<{
+    moveSlots?: Array<{ maxpp?: number }>;
+    name?: string;
+  }>;
+  pokemon?: Array<{
+    fullname?: string;
+    name?: string;
+    species?: { name?: string };
+    position?: number;
+    hp?: number;
+    maxhp?: number;
+    status?: string;
+    fainted?: boolean;
+    isActive?: boolean;
+  }>;
+}
 
-  private async tryChooseCpuMove(session: BattleSession): Promise<void> {
-    const battle = session.battle as unknown as {
-      sides?: Array<{
-        requestState?: string;
-        active?: Array<{
-          name?: string;
-          types?: string[];
-          getTypes?: () => string[];
-          moveSlots?: Array<{ id?: string; move: string; pp: number; disabled?: boolean }>;
-        }>;
-      }>;
-      dex?: {
-        moves?: { get?: (idOrName: string) => { type?: string; basePower?: number } | undefined };
-        getImmunity?: (source: string, target: unknown) => boolean;
-        getEffectiveness?: (source: string, target: unknown) => number;
-      };
-    };
-
-    const p2Side = battle.sides?.[1];
-    const p1Side = battle.sides?.[0];
-    if (p2Side?.requestState !== 'move') return;
-
-    const p2MoveChoices =
-      p2Side.active?.[0]?.moveSlots
-        ?.map((slot, index) => {
-          const dexMove = battle.dex?.moves?.get?.(slot.id || slot.move);
-          const targetPokemon = p1Side?.active?.[0];
-          const moveType = dexMove?.type;
-          const isImmune =
-            !!moveType &&
-            !!targetPokemon &&
-            battle.dex?.getImmunity
-              ? !battle.dex.getImmunity(moveType, targetPokemon)
-              : false;
-          const typeMod =
-            !!moveType && !!targetPokemon && battle.dex?.getEffectiveness
-              ? battle.dex.getEffectiveness(moveType, targetPokemon)
-              : 0;
-          const effectivenessMultiplier = isImmune
-            ? 0
-            : typeof typeMod === 'number'
-              ? Math.pow(2, typeMod)
-              : 1;
-          return {
-            index: index + 1,
-            name: slot.move,
-            type: dexMove?.type,
-            power:
-              typeof dexMove?.basePower === 'number' && dexMove.basePower > 0
-                ? dexMove.basePower
-                : null,
-            pp: slot.pp,
-            effectivenessMultiplier,
-            isImmune,
-            disabled: !!slot.disabled,
-          };
-        })
-        .filter((move) => !move.disabled && move.pp > 0)
-        .map(({ disabled, ...move }) => {
-          void disabled;
-          return move;
-        }) ?? [];
-
-    if (p2MoveChoices.length === 0) return;
-
-    const decision = await this.safeChooseCpuMove(session, p2MoveChoices, {
-      cpuPokemonName: p2Side.active?.[0]?.name || 'Unknown',
-      playerPokemonName: p1Side?.active?.[0]?.name || 'Unknown',
-    });
-
-    const selected = p2MoveChoices.find((move) => move.index === decision.moveIndex);
-    const finalMove = selected ?? p2MoveChoices[0];
-
-    session.p2MoveChoice = `move ${finalMove.index}`;
-    session.lastCpuDecision = {
-      moveIndex: finalMove.index,
-      moveName: finalMove.name,
-      source: decision.source,
-      modelId: decision.modelId,
-      latencyMs: decision.latencyMs,
-      rawResponse: decision.rawResponse,
-      error: decision.error,
-      turn: session.currentTurn + 1,
-    };
-  }
-
-  private async safeChooseCpuMove(
-    session: BattleSession,
-    p2MoveChoices: Array<{
-      index: number;
-      name: string;
-      type?: string;
-      power?: number | null;
-      pp?: number;
-    }>,
-    names: { cpuPokemonName: string; playerPokemonName: string }
-  ): Promise<CpuMoveDecisionResult> {
-    try {
-      return await this.cpuMoveAiService.chooseCpuMove({
-        battleId: session.id,
-        turn: session.currentTurn + 1,
-        cpuPokemonName: names.cpuPokemonName,
-        playerPokemonName: names.playerPokemonName,
-        availableMoves: p2MoveChoices,
-        recentLog: session.turnLog.slice(-4),
-        cpuPokemonTypes: this.getPokemonTypes(session.battle.sides[1]?.active?.[0]),
-        playerPokemonTypes: this.getPokemonTypes(session.battle.sides[0]?.active?.[0]),
-      });
-    } catch (error) {
-      if (process.env.OPENAI_CPU_STRICT === 'true') {
-        throw error;
-      }
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      return {
-        moveIndex: p2MoveChoices[0].index,
-        source: 'fallback',
-        modelId: process.env.OPENAI_CPU_MODEL || 'gpt-4.1-mini',
-        latencyMs: 0,
-        error: message,
-      };
-    }
-  }
-
-  private getPokemonTypes(
-    pokemon: unknown
-  ): string[] | undefined {
-    const p = pokemon as { types?: string[]; getTypes?: () => string[] } | undefined;
-    if (!p) return undefined;
-    if (Array.isArray(p.types) && p.types.length > 0) return p.types;
-    try {
-      const types = p.getTypes?.();
-      return Array.isArray(types) ? types : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private getLegalMoveChoicesFromRequest(request: ShowdownRequest): string[] {
-    const moves = request.active?.[0]?.moves ?? [];
-    return moves
-      .map((move, index) => ({ move, index: index + 1 }))
-      .filter(({ move }) => !move.disabled && (move.pp ?? 1) > 0)
-      .map(({ index }) => `move ${index}`);
-  }
+interface BattleWithDex {
+  sides?: BattleSideLike[];
+  dex?: {
+    moves?: { get?: (idOrName: string) => { type?: string; basePower?: number } | undefined };
+    getImmunity?: (source: string, target: unknown) => boolean;
+    getEffectiveness?: (source: string, target: unknown) => number;
+  };
 }

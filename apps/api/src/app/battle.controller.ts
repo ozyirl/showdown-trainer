@@ -56,6 +56,34 @@ export class BattleController {
     );
   }
 
+  @Post(':id/action')
+  async submitAction(
+    @Param('id') battleId: string,
+    @Body() body: { player: 'p1' | 'p2'; choice?: string; moveIndex?: number }
+  ) {
+    if (typeof body.choice === 'string' && body.choice.trim()) {
+      return this.battleSessionManager.submitAction(
+        battleId,
+        body.player,
+        body.choice
+      );
+    }
+
+    if (typeof body.moveIndex === 'number') {
+      return this.battleSessionManager.submitMove(
+        battleId,
+        body.player,
+        body.moveIndex
+      );
+    }
+
+    return this.battleSessionManager.submitAction(
+      battleId,
+      body.player,
+      'default'
+    );
+  }
+
   @Get(':id/state')
   async getBattleState(@Param('id') battleId: string) {
     return this.battleSessionManager.getBattleState(battleId);
