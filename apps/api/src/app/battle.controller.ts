@@ -84,6 +84,32 @@ export class BattleController {
     );
   }
 
+  @Post(':id/continue')
+  async continueBattle(@Param('id') battleId: string) {
+    return this.battleSessionManager.continueBattle(battleId);
+  }
+
+  @Post(':id/ack')
+  async ackEvent(
+    @Param('id') battleId: string,
+    @Body() body: { eventSeq: number }
+  ) {
+    return this.battleSessionManager.ackEvent(battleId, body.eventSeq);
+  }
+
+  @Get(':id/events')
+  async getBattleEvents(
+    @Param('id') battleId: string,
+    @Query('afterSeq') afterSeq?: string,
+    @Query('limit') limit?: string
+  ) {
+    return this.battleSessionManager.getBattleEvents(
+      battleId,
+      afterSeq ? Number(afterSeq) : 0,
+      limit ? Number(limit) : 200
+    );
+  }
+
   @Get(':id/state')
   async getBattleState(@Param('id') battleId: string) {
     return this.battleSessionManager.getBattleState(battleId);

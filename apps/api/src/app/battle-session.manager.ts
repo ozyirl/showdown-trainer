@@ -80,7 +80,17 @@ export interface BattleState {
   currentTurn: number;
   waitingForMove: boolean;
   pendingPlayers: ('p1' | 'p2')[];
-  phase: 'team-preview' | 'awaiting-actions' | 'resolving' | 'ended';
+  phase:
+    | 'team-preview'
+    | 'awaiting-actions'
+    | 'awaiting-forced-switch-p1'
+    | 'awaiting-forced-switch-p2'
+    | 'awaiting-event-ack'
+    | 'resolving'
+    | 'ended';
+  eventCursor: number;
+  recentPlaybackEvents: BattlePlaybackEvent[];
+  awaitingAckEventSeq: number | null;
   lastAction: {
     player: 'p1' | 'p2';
     choice: string;
@@ -126,6 +136,35 @@ export interface BattleTurnEvent {
   status?: string | null;
 }
 
+export interface BattlePlaybackEvent {
+  seq: number;
+  turn: number;
+  type:
+    | 'TURN'
+    | 'MOVE'
+    | 'SWITCH_IN'
+    | 'DRAG'
+    | 'DAMAGE'
+    | 'HEAL'
+    | 'STATUS'
+    | 'EFFECTIVENESS'
+    | 'CRIT'
+    | 'MISS'
+    | 'FAIL'
+    | 'CANT'
+    | 'PREPARE'
+    | 'ACTIVATE'
+    | 'FAINT'
+    | 'FORCED_SWITCH_REQUIRED'
+    | 'REQUEST_SWITCH'
+    | 'REQUEST_MOVE'
+    | 'PAUSE'
+    | 'TURN_END'
+    | 'WIN';
+  timestamp: number;
+  payload: Record<string, unknown>;
+}
+
 class BattleSession {
   id: string;
   battle: Battle;
@@ -138,6 +177,11 @@ class BattleSession {
   lastTurnEvents: BattleTurnEvent[] = [];
   lastCpuDecision: BattleState['lastCpuDecision'] = null;
   isResolving = false;
+  phase: BattleState['phase'] = 'awaiting-actions';
+  eventLog: BattlePlaybackEvent[] = [];
+  pendingPlaybackEvents: BattlePlaybackEvent[] = [];
+  nextEventSeq = 1;
+  awaitingAckEventSeq: number | null = null;
 
   constructor(id: string, battle: Battle) {
     this.id = id;
@@ -232,6 +276,7 @@ export class BattleSessionManager {
       battle as never,
       session.lastLogIndex
     );
+    session.phase = this.derivePhaseFromRequests(this.battleService.getRequests(battleId));
 
     return this.getBattleState(battleId);
   }
@@ -267,6 +312,15 @@ export class BattleSessionManager {
         'Turn is already resolving. Wait for CPU move / turn result.'
       );
     }
+    if (session.awaitingAckEventSeq !== null) {
+      throw new ConflictException(
+        `Event ${session.awaitingAckEventSeq} must be acknowledged before continuing`
+      );
+    }
+
+    if (session.phase === 'resolving') {
+      throw new ConflictException('Battle is currently resolving events');
+    }
 
     const requests = this.battleService.getRequests(battleId);
     const normalizedChoice = this.normalizePlayerChoice(
@@ -292,9 +346,10 @@ export class BattleSessionManager {
 
       if (this.isReadyToResolve(session, requests)) {
         session.isResolving = true;
-        return await this.processTurn(battleId, requests);
+        return await this.resolveOneStep(battleId, requests);
       }
 
+      session.phase = this.derivePhaseFromRequests(requests);
       return this.getBattleState(battleId);
     } finally {
       if (session.isResolving) {
@@ -306,7 +361,95 @@ export class BattleSessionManager {
     }
   }
 
-  private async processTurn(
+  async continueBattle(battleId: string): Promise<BattleState> {
+    const session = this.sessions.get(battleId);
+    if (!session) {
+      throw new NotFoundException('Battle not found');
+    }
+    if (session.battle.ended) {
+      return this.getBattleState(battleId);
+    }
+    if (session.isResolving) {
+      throw new ConflictException('Battle is already resolving');
+    }
+    if (session.awaitingAckEventSeq !== null) {
+      throw new ConflictException(
+        `Event ${session.awaitingAckEventSeq} must be acknowledged before continuing`
+      );
+    }
+
+    const requests = this.battleService.getRequests(battleId);
+    const p1Legal = this.battleService.getLegalOptionsForRequest(requests.p1);
+    const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
+    const p1NeedsChoice = this.playerNeedsChoice('p1', p1Legal);
+    const p2NeedsChoice = this.playerNeedsChoice('p2', p2Legal);
+
+    if (p1NeedsChoice) {
+      throw new BadRequestException('Player action required before continuing');
+    }
+    if (!p2NeedsChoice) {
+      return this.getBattleState(battleId);
+    }
+
+    session.isResolving = true;
+    try {
+      await this.tryChooseCpuAction(session, requests);
+      this.autofillNonActionableChoices(session, requests);
+      if (!this.isReadyToResolve(session, requests)) {
+        session.isResolving = false;
+        return this.getBattleState(battleId);
+      }
+      return await this.resolveOneStep(battleId, requests);
+    } finally {
+      if (session.isResolving) {
+        session.isResolving = false;
+      }
+    }
+  }
+
+  ackEvent(battleId: string, eventSeq: number): BattleState {
+    const session = this.sessions.get(battleId);
+    if (!session) {
+      throw new NotFoundException('Battle not found');
+    }
+    if (!Number.isInteger(eventSeq) || eventSeq <= 0) {
+      throw new BadRequestException('eventSeq must be a positive integer');
+    }
+    if (session.awaitingAckEventSeq === null) {
+      throw new BadRequestException('No pending event acknowledgement');
+    }
+    if (session.awaitingAckEventSeq !== eventSeq) {
+      throw new BadRequestException(
+        `Expected ACK for event ${session.awaitingAckEventSeq}, received ${eventSeq}`
+      );
+    }
+
+    session.awaitingAckEventSeq = null;
+    this.emitNextPlaybackEvent(session);
+
+    if (session.awaitingAckEventSeq !== null) {
+      session.phase = 'awaiting-event-ack';
+    } else if (!session.battle.ended) {
+      session.phase = this.derivePhaseFromRequests(this.battleService.getRequests(battleId));
+    } else {
+      session.phase = 'ended';
+    }
+
+    return this.getBattleState(battleId);
+  }
+
+  getBattleEvents(battleId: string, afterSeq = 0, limit = 200): BattlePlaybackEvent[] {
+    const session = this.sessions.get(battleId);
+    if (!session) {
+      throw new NotFoundException('Battle not found');
+    }
+    const cappedLimit = Math.max(1, Math.min(1000, Math.floor(limit) || 200));
+    return session.eventLog
+      .filter((event) => event.seq > afterSeq)
+      .slice(0, cappedLimit);
+  }
+
+  private async resolveOneStep(
     battleId: string,
     requests: { p1: ShowdownRequest; p2: ShowdownRequest }
   ): Promise<BattleState> {
@@ -315,58 +458,32 @@ export class BattleSessionManager {
       throw new NotFoundException('Battle not found');
     }
 
-    let workingRequests = requests;
-    let safetyCounter = 0;
-    const aggregatedEvents: BattleTurnEvent[] = [];
-
     try {
-      while (safetyCounter < 6) {
-        safetyCounter++;
-        const p1Legal = this.battleService.getLegalOptionsForRequest(workingRequests.p1);
-        const p2Legal = this.battleService.getLegalOptionsForRequest(workingRequests.p2);
+      const p1Legal = this.battleService.getLegalOptionsForRequest(requests.p1);
+      const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
+      const p1Choice = session.p1Choice ?? this.pickDefaultChoice(p1Legal);
+      const p2Choice = session.p2Choice ?? this.pickDefaultChoice(p2Legal);
 
-        const p1Choice = session.p1Choice ?? this.pickDefaultChoice(p1Legal);
-        const p2Choice = session.p2Choice ?? this.pickDefaultChoice(p2Legal);
+      session.phase = 'resolving';
+      const stepResult = this.battleService.step(battleId, p1Choice, p2Choice);
+      const newLogs = stepResult.rawLogDelta;
+      const formattedNewLogs = this.formatRecentLog(newLogs);
+      const turnEvents = this.buildTurnEvents(newLogs);
 
-        const stepResult = this.battleService.step(battleId, p1Choice, p2Choice);
-        const newLogs = stepResult.rawLogDelta;
-        const formattedNewLogs = this.formatRecentLog(newLogs);
-        const turnEvents = this.buildTurnEvents(newLogs);
+      session.turnLog.push(...formattedNewLogs);
+      session.lastTurnEvents = this.compactTurnEvents(turnEvents);
+      this.enqueuePlaybackEvents(session, session.lastTurnEvents);
+      session.lastLogIndex = session.battle.log.length;
+      session.currentTurn =
+        (session.battle as unknown as { turn?: number }).turn ??
+        session.currentTurn + 1;
 
-        aggregatedEvents.push(...turnEvents);
-        session.turnLog.push(...formattedNewLogs);
-        session.lastLogIndex = session.battle.log.length;
-        session.currentTurn =
-          (session.battle as unknown as { turn?: number }).turn ??
-          session.currentTurn + 1;
-
-        session.clearChoices();
-        workingRequests = stepResult.requests;
-
-        if (stepResult.ended) {
-          break;
-        }
-
-        // Auto-advance CPU-only pending phases (commonly forced switch after faint)
-        // so the battle doesn't stall when p1 has no actionable request.
-        const nextP1Legal = this.battleService.getLegalOptionsForRequest(workingRequests.p1);
-        const nextP2Legal = this.battleService.getLegalOptionsForRequest(workingRequests.p2);
-        const p1NeedsChoice = this.playerNeedsChoice('p1', nextP1Legal);
-        const p2NeedsChoice = this.playerNeedsChoice('p2', nextP2Legal);
-
-        if (p1NeedsChoice) {
-          break;
-        }
-        if (!p2NeedsChoice) {
-          break;
-        }
-
-        await this.tryChooseCpuAction(session, workingRequests);
-        this.autofillNonActionableChoices(session, workingRequests);
-
-        if (!this.isReadyToResolve(session, workingRequests)) {
-          break;
-        }
+      session.clearChoices();
+      session.phase = this.derivePhaseFromRequests(stepResult.requests);
+      this.enqueueRequestBoundaryEvents(session, stepResult.requests);
+      this.emitNextPlaybackEvent(session);
+      if (session.awaitingAckEventSeq !== null) {
+        session.phase = 'awaiting-event-ack';
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
@@ -381,7 +498,6 @@ export class BattleSessionManager {
       throw error;
     }
 
-    session.lastTurnEvents = this.compactTurnEvents(aggregatedEvents);
     session.clearChoices();
     session.isResolving = false;
 
@@ -422,14 +538,19 @@ export class BattleSessionManager {
     if (this.playerNeedsChoice('p2', p2Legal) && !session.hasChoice('p2')) {
       pendingPlayers.push('p2');
     }
+    if (session.awaitingAckEventSeq !== null) {
+      pendingPlayers.length = 0;
+    }
 
-    const phase: BattleState['phase'] = battle.ended
-      ? 'ended'
-      : p1Legal.teamPreview || p2Legal.teamPreview
-        ? 'team-preview'
-        : session.isResolving
-          ? 'resolving'
-          : 'awaiting-actions';
+    if (session.awaitingAckEventSeq !== null) {
+      session.phase = 'awaiting-event-ack';
+    } else if (battle.ended) {
+      session.phase = 'ended';
+    } else if (session.isResolving) {
+      session.phase = 'resolving';
+    } else if (session.phase === 'resolving') {
+      session.phase = this.derivePhaseFromRequests(requests);
+    }
 
     return {
       battleId,
@@ -463,7 +584,10 @@ export class BattleSessionManager {
         !p1Legal.forceSwitch &&
         pendingPlayers.includes('p1'),
       pendingPlayers,
-      phase,
+      phase: session.phase,
+      eventCursor: session.nextEventSeq - 1,
+      recentPlaybackEvents: session.eventLog.slice(-20),
+      awaitingAckEventSeq: session.awaitingAckEventSeq,
       lastAction: session.lastAction,
       lastTurnEvents: session.lastTurnEvents,
       lastCpuDecision: session.lastCpuDecision,
@@ -547,6 +671,170 @@ export class BattleSessionManager {
       return legal.switchChoices[0];
     }
     return 'default';
+  }
+
+  private derivePhaseFromRequests(requests: {
+    p1: ShowdownRequest;
+    p2: ShowdownRequest;
+  }): BattleState['phase'] {
+    const p1Legal = this.battleService.getLegalOptionsForRequest(requests.p1);
+    const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
+    if (p1Legal.teamPreview || p2Legal.teamPreview) {
+      return 'team-preview';
+    }
+    if (p1Legal.forceSwitch) {
+      return 'awaiting-forced-switch-p1';
+    }
+    if (p2Legal.forceSwitch) {
+      return 'awaiting-forced-switch-p2';
+    }
+    return 'awaiting-actions';
+  }
+
+  private enqueuePlaybackEvents(
+    session: BattleSession,
+    turnEvents: BattleTurnEvent[]
+  ): void {
+    for (const event of turnEvents) {
+      session.pendingPlaybackEvents.push({
+        seq: session.nextEventSeq++,
+        turn: session.currentTurn,
+        type: this.mapTurnEventType(event.kind),
+        timestamp: Date.now(),
+        payload: {
+          text: event.text,
+          actor: event.actor,
+          target: event.target,
+          moveName: event.moveName,
+          hpPercent: event.hpPercent,
+          status: event.status,
+        },
+      });
+    }
+  }
+
+  private enqueueRequestBoundaryEvents(
+    session: BattleSession,
+    requests: { p1: ShowdownRequest; p2: ShowdownRequest }
+  ): void {
+    if (session.lastTurnEvents.some((event) => event.kind === 'faint')) {
+      session.pendingPlaybackEvents.push({
+        seq: session.nextEventSeq++,
+        turn: session.currentTurn,
+        type: 'PAUSE',
+        timestamp: Date.now(),
+        payload: {
+          reason: 'faint',
+        },
+      });
+    }
+
+    const p1Legal = this.battleService.getLegalOptionsForRequest(requests.p1);
+    const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
+    if (p1Legal.forceSwitch) {
+      session.pendingPlaybackEvents.push({
+        seq: session.nextEventSeq++,
+        turn: session.currentTurn,
+        type: 'REQUEST_SWITCH',
+        timestamp: Date.now(),
+        payload: {
+          player: 'p1',
+          legalChoices: p1Legal.switchChoices,
+        },
+      });
+    }
+    if (p2Legal.forceSwitch) {
+      session.pendingPlaybackEvents.push({
+        seq: session.nextEventSeq++,
+        turn: session.currentTurn,
+        type: 'REQUEST_SWITCH',
+        timestamp: Date.now(),
+        payload: {
+          player: 'p2',
+          legalChoices: p2Legal.switchChoices,
+        },
+      });
+    }
+    if (p1Legal.moveChoices.length > 0) {
+      session.pendingPlaybackEvents.push({
+        seq: session.nextEventSeq++,
+        turn: session.currentTurn,
+        type: 'REQUEST_MOVE',
+        timestamp: Date.now(),
+        payload: {
+          player: 'p1',
+          legalChoices: p1Legal.moveChoices,
+        },
+      });
+    }
+    if (p2Legal.moveChoices.length > 0) {
+      session.pendingPlaybackEvents.push({
+        seq: session.nextEventSeq++,
+        turn: session.currentTurn,
+        type: 'REQUEST_MOVE',
+        timestamp: Date.now(),
+        payload: {
+          player: 'p2',
+          legalChoices: p2Legal.moveChoices,
+        },
+      });
+    }
+    session.pendingPlaybackEvents.push({
+      seq: session.nextEventSeq++,
+      turn: session.currentTurn,
+      type: 'TURN_END',
+      timestamp: Date.now(),
+      payload: {
+        phase: this.derivePhaseFromRequests(requests),
+      },
+    });
+  }
+
+  private emitNextPlaybackEvent(session: BattleSession): void {
+    if (session.awaitingAckEventSeq !== null) return;
+    const next = session.pendingPlaybackEvents.shift();
+    if (!next) return;
+    session.eventLog.push(next);
+    session.awaitingAckEventSeq = next.seq;
+  }
+
+  private mapTurnEventType(kind: BattleTurnEvent['kind']): BattlePlaybackEvent['type'] {
+    switch (kind) {
+      case 'turn':
+        return 'TURN';
+      case 'move':
+        return 'MOVE';
+      case 'switch':
+        return 'SWITCH_IN';
+      case 'drag':
+        return 'DRAG';
+      case 'damage':
+        return 'DAMAGE';
+      case 'heal':
+        return 'HEAL';
+      case 'status':
+        return 'STATUS';
+      case 'effectiveness':
+        return 'EFFECTIVENESS';
+      case 'crit':
+        return 'CRIT';
+      case 'miss':
+        return 'MISS';
+      case 'fail':
+        return 'FAIL';
+      case 'cant':
+        return 'CANT';
+      case 'prepare':
+        return 'PREPARE';
+      case 'activate':
+        return 'ACTIVATE';
+      case 'faint':
+        return 'FAINT';
+      case 'win':
+        return 'WIN';
+      default:
+        return 'PAUSE';
+    }
   }
 
   private playerNeedsChoice(player: 'p1' | 'p2', legal: ShowdownLegalOptions): boolean {

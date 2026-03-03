@@ -15,6 +15,23 @@ describe('BattleSessionManager 6v6 flow', () => {
     manager = new BattleSessionManager(battleService, cpuMoveAiService);
   });
 
+  async function ackUntilSettled(
+    battleManager: BattleSessionManager,
+    battleId: string,
+    state: { awaitingAckEventSeq: number | null }
+  ) {
+    let current = state;
+    let guard = 0;
+    while (current.awaitingAckEventSeq !== null && guard < 100) {
+      guard++;
+      current = (await battleManager.ackEvent(
+        battleId,
+        current.awaitingAckEventSeq
+      )) as unknown as typeof current;
+    }
+    return current;
+  }
+
   it('initializes 6 pokemon on each side by default', async () => {
     const state = await manager.createBattle();
 
@@ -80,7 +97,8 @@ describe('BattleSessionManager 6v6 flow', () => {
     const state = await manager.createBattle();
     const firstMoveChoice = state.availableMoves[0]?.choice ?? 'move 1';
 
-    const next = await manager.submitAction(state.battleId, 'p1', firstMoveChoice);
+    const unresolved = await manager.submitAction(state.battleId, 'p1', firstMoveChoice);
+    const next = await ackUntilSettled(manager, state.battleId, unresolved);
 
     expect(next.currentTurn).toBeGreaterThanOrEqual(1);
     expect(next.lastTurnEvents.length).toBeGreaterThan(0);
@@ -184,6 +202,11 @@ describe('BattleSessionManager 6v6 flow', () => {
       lastTurnEvents: [],
       lastCpuDecision: null,
       isResolving: false,
+      phase: 'awaiting-actions',
+      eventLog: [],
+      pendingPlaybackEvents: [],
+      nextEventSeq: 1,
+      awaitingAckEventSeq: null as number | null,
       hasChoice(player: 'p1' | 'p2') {
         return player === 'p1' ? this.p1Choice !== null : this.p2Choice !== null;
       },
@@ -202,14 +225,15 @@ describe('BattleSessionManager 6v6 flow', () => {
       fakeSession
     );
 
-    const result = await localManager.submitAction('fake-battle', 'p1', 'move 1');
+    const unresolved = await localManager.submitAction('fake-battle', 'p1', 'move 1');
+    const result = await ackUntilSettled(localManager, 'fake-battle', unresolved);
 
     expect(result.phase).toBe('awaiting-actions');
     expect(fakeSession.isResolving).toBe(false);
     expect(battleServiceMock.step).toHaveBeenCalled();
   });
 
-  it('auto-resolves cpu forced switch after faint when p1 has no action', async () => {
+  it('pauses on cpu forced switch after faint and continues in a separate step', async () => {
     const realBattleService = new BattleService();
     const reqMoveVsMove: ShowdownRequest = {
       active: [{ moves: [{ move: 'Tackle', pp: 32, disabled: false }] }],
@@ -318,6 +342,11 @@ describe('BattleSessionManager 6v6 flow', () => {
       lastTurnEvents: [],
       lastCpuDecision: null,
       isResolving: false,
+      phase: 'awaiting-actions',
+      eventLog: [],
+      pendingPlaybackEvents: [],
+      nextEventSeq: 1,
+      awaitingAckEventSeq: null as number | null,
       hasChoice(player: 'p1' | 'p2') {
         return player === 'p1' ? this.p1Choice !== null : this.p2Choice !== null;
       },
@@ -336,10 +365,53 @@ describe('BattleSessionManager 6v6 flow', () => {
       fakeSession
     );
 
-    await localManager.submitAction('fake-battle-switch', 'p1', 'move 1');
+    const unresolvedPaused = await localManager.submitAction(
+      'fake-battle-switch',
+      'p1',
+      'move 1'
+    );
+    const paused = await ackUntilSettled(
+      localManager,
+      'fake-battle-switch',
+      unresolvedPaused
+    );
+    expect(paused.phase).toBe('awaiting-forced-switch-p2');
+    expect(paused.pendingPlayers).toContain('p2');
+
+    const unresolvedResumed = await localManager.continueBattle('fake-battle-switch');
+    const resumed = await ackUntilSettled(
+      localManager,
+      'fake-battle-switch',
+      unresolvedResumed
+    );
 
     expect(stepCalls[0]).toEqual({ p1: 'move 1', p2: 'move 1' });
     expect(stepCalls[1]).toEqual({ p1: 'default', p2: 'switch 2' });
+    expect(resumed.phase).toBe('awaiting-actions');
+  });
+
+  it('records ordered playback events and supports incremental fetch', async () => {
+    const state = await manager.createBattle();
+    const firstMoveChoice = state.availableMoves[0]?.choice ?? 'move 1';
+    const unresolved = await manager.submitAction(state.battleId, 'p1', firstMoveChoice);
+    const nextState = await ackUntilSettled(manager, state.battleId, unresolved);
+
+    expect(nextState.eventCursor).toBeGreaterThan(0);
+
+    const allEvents = manager.getBattleEvents(state.battleId, 0, 200);
+    expect(allEvents.length).toBeGreaterThan(0);
+    for (let i = 1; i < allEvents.length; i++) {
+      expect(allEvents[i].seq).toBe(allEvents[i - 1].seq + 1);
+    }
+
+    const tailEvents = manager.getBattleEvents(
+      state.battleId,
+      allEvents[0].seq,
+      200
+    );
+    if (allEvents.length > 1) {
+      expect(tailEvents[0].seq).toBe(allEvents[1].seq);
+    }
   });
 
   it('cpu chooses legal action for move and switch phases', async () => {
