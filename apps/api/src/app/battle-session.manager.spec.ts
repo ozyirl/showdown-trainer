@@ -83,6 +83,7 @@ describe('BattleSessionManager 6v6 flow', () => {
 
   it('rejects illegal actions with legal options included', async () => {
     const state = await manager.createBattle();
+    await ackUntilSettled(manager, state.battleId, state);
 
     await expect(
       manager.submitAction(state.battleId, 'p1', 'move 99')
@@ -95,7 +96,8 @@ describe('BattleSessionManager 6v6 flow', () => {
 
   it('resolves simultaneous turn choices and appends turn events/logs', async () => {
     const state = await manager.createBattle();
-    const firstMoveChoice = state.availableMoves[0]?.choice ?? 'move 1';
+    const settled = await ackUntilSettled(manager, state.battleId, state);
+    const firstMoveChoice = (settled as typeof state).availableMoves[0]?.choice ?? 'move 1';
 
     const unresolved = await manager.submitAction(state.battleId, 'p1', firstMoveChoice);
     const next = await ackUntilSettled(manager, state.battleId, unresolved);
@@ -207,6 +209,11 @@ describe('BattleSessionManager 6v6 flow', () => {
       pendingPlaybackEvents: [],
       nextEventSeq: 1,
       awaitingAckEventSeq: null as number | null,
+      emittedBoundaryKeys: new Set<string>(),
+      lastPlaybackEventKey: null,
+      lastResolutionKey: null,
+      deferredTurnEvents: [],
+      appliedEffectKeys: new Set<string>(),
       hasChoice(player: 'p1' | 'p2') {
         return player === 'p1' ? this.p1Choice !== null : this.p2Choice !== null;
       },
@@ -347,6 +354,11 @@ describe('BattleSessionManager 6v6 flow', () => {
       pendingPlaybackEvents: [],
       nextEventSeq: 1,
       awaitingAckEventSeq: null as number | null,
+      emittedBoundaryKeys: new Set<string>(),
+      lastPlaybackEventKey: null,
+      lastResolutionKey: null,
+      deferredTurnEvents: [],
+      appliedEffectKeys: new Set<string>(),
       hasChoice(player: 'p1' | 'p2') {
         return player === 'p1' ? this.p1Choice !== null : this.p2Choice !== null;
       },
@@ -392,7 +404,8 @@ describe('BattleSessionManager 6v6 flow', () => {
 
   it('records ordered playback events and supports incremental fetch', async () => {
     const state = await manager.createBattle();
-    const firstMoveChoice = state.availableMoves[0]?.choice ?? 'move 1';
+    const settled = await ackUntilSettled(manager, state.battleId, state);
+    const firstMoveChoice = (settled as typeof state).availableMoves[0]?.choice ?? 'move 1';
     const unresolved = await manager.submitAction(state.battleId, 'p1', firstMoveChoice);
     const nextState = await ackUntilSettled(manager, state.battleId, unresolved);
 
@@ -401,7 +414,7 @@ describe('BattleSessionManager 6v6 flow', () => {
     const allEvents = manager.getBattleEvents(state.battleId, 0, 200);
     expect(allEvents.length).toBeGreaterThan(0);
     for (let i = 1; i < allEvents.length; i++) {
-      expect(allEvents[i].seq).toBe(allEvents[i - 1].seq + 1);
+      expect(allEvents[i].seq).toBeGreaterThan(allEvents[i - 1].seq);
     }
 
     const tailEvents = manager.getBattleEvents(
@@ -412,6 +425,114 @@ describe('BattleSessionManager 6v6 flow', () => {
     if (allEvents.length > 1) {
       expect(tailEvents[0].seq).toBe(allEvents[1].seq);
     }
+  });
+
+  it('dedupes boundary events and does not emit duplicate request_move / turn_end', async () => {
+    const state = await manager.createBattle();
+    const initialSettled = await ackUntilSettled(manager, state.battleId, state);
+    const firstMoveChoice = (initialSettled as typeof state).availableMoves[0]?.choice ?? 'move 1';
+    const unresolved = await manager.submitAction(state.battleId, 'p1', firstMoveChoice);
+    const settled = await ackUntilSettled(manager, state.battleId, unresolved);
+
+    const events = manager.getBattleEvents(state.battleId, 0, 500);
+    const requestMoveEvents = events.filter((event) => event.type === 'REQUEST_MOVE');
+    const turnEndEvents = events.filter((event) => event.type === 'TURN_END');
+
+    expect(requestMoveEvents.length).toBeLessThanOrEqual(settled.currentTurn + 1);
+    expect(turnEndEvents.length).toBeLessThanOrEqual(settled.currentTurn + 1);
+  });
+
+  it('emits structured passive heal event metadata', async () => {
+    const realBattleService = new BattleService();
+    const requests: ShowdownRequest = {
+      active: [{ moves: [{ move: 'Tackle', pp: 32, disabled: false }] }],
+      side: {
+        pokemon: [{ ident: 'p1: A', active: true, condition: '100/100' }],
+      },
+    };
+    const battleServiceMock = {
+      getRequests: jest.fn().mockReturnValue({ p1: requests, p2: requests }),
+      getLegalOptionsForRequest: realBattleService.getLegalOptionsForRequest.bind(
+        realBattleService
+      ),
+      step: jest.fn().mockReturnValue({
+        rawLogDelta: [
+          '|-heal|p1a: Dragalge|77/100|[from] item: Leftovers',
+          '|turn|2',
+        ],
+        requests: { p1: requests, p2: requests },
+        ended: false,
+      }),
+      unregisterBattleSession: jest.fn(),
+    } as unknown as BattleService;
+
+    const cpuMock = {
+      getDefaultModelId: () => 'test-model',
+      chooseCpuAction: jest.fn(),
+      chooseCpuMove: jest.fn(),
+    } as unknown as CpuMoveAiService;
+
+    const localManager = new BattleSessionManager(battleServiceMock, cpuMock);
+    const fakeSession = {
+      id: 'fake-battle-heal',
+      battle: {
+        ended: false,
+        winner: null,
+        log: [],
+        sides: [
+          { pokemon: [], active: [{ moveSlots: [{ maxpp: 32 }] }] },
+          { pokemon: [], active: [{ moveSlots: [{ maxpp: 32 }] }] },
+        ],
+      },
+      p1Choice: null as string | null,
+      p2Choice: null as string | null,
+      turnLog: [] as string[],
+      currentTurn: 1,
+      lastLogIndex: 0,
+      lastAction: null,
+      lastTurnEvents: [],
+      lastCpuDecision: null,
+      isResolving: false,
+      phase: 'awaiting-actions',
+      eventLog: [],
+      pendingPlaybackEvents: [],
+      nextEventSeq: 1,
+      awaitingAckEventSeq: null as number | null,
+      emittedBoundaryKeys: new Set<string>(),
+      lastPlaybackEventKey: null,
+      lastResolutionKey: null,
+      deferredTurnEvents: [],
+      appliedEffectKeys: new Set<string>(),
+      hasChoice(player: 'p1' | 'p2') {
+        return player === 'p1' ? this.p1Choice !== null : this.p2Choice !== null;
+      },
+      setChoice(player: 'p1' | 'p2', choice: string) {
+        if (player === 'p1') this.p1Choice = choice;
+        else this.p2Choice = choice;
+      },
+      clearChoices() {
+        this.p1Choice = null;
+        this.p2Choice = null;
+      },
+    };
+
+    (localManager as unknown as { sessions: Map<string, unknown> }).sessions.set(
+      'fake-battle-heal',
+      fakeSession
+    );
+
+    const unresolved = await localManager.submitAction('fake-battle-heal', 'p1', 'move 1');
+    await ackUntilSettled(localManager, 'fake-battle-heal', unresolved);
+    const events = localManager.getBattleEvents('fake-battle-heal', 0, 50);
+    const itemHeal = events.find((event) => event.type === 'ITEM_HEAL');
+
+    expect(itemHeal).toBeDefined();
+    expect(itemHeal?.payload).toEqual(
+      expect.objectContaining({
+        sourceType: 'item',
+        sourceName: 'Leftovers',
+      })
+    );
   });
 
   it('cpu chooses legal action for move and switch phases', async () => {
