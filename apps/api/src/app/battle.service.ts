@@ -140,7 +140,14 @@ interface DexSpeciesLike {
   forme?: string;
   battleOnly?: string | string[];
   isNonstandard?: string | null;
-  baseStats: { hp: number; atk: number; def: number; spa: number; spd: number; spe: number };
+  baseStats: {
+    hp: number;
+    atk: number;
+    def: number;
+    spa: number;
+    spd: number;
+    spe: number;
+  };
   abilities: unknown;
   weightkg?: number;
   gender?: 'M' | 'F' | 'N';
@@ -219,19 +226,21 @@ export class BattleService {
     return { p1, p2 };
   }
 
-  step(
-    battleId: string,
-    p1Choice: string,
-    p2Choice: string
-  ): BattleStepResult {
+  step(battleId: string, p1Choice: string, p2Choice: string): BattleStepResult {
     const session = this.turnStepSessions.get(battleId);
     if (!session) {
       throw new BadRequestException(`Battle "${battleId}" not found`);
     }
 
     const requests = this.getRequests(battleId);
-    const resolvedP1Choice = this.resolveChoiceForRequest(requests.p1, p1Choice);
-    const resolvedP2Choice = this.resolveChoiceForRequest(requests.p2, p2Choice);
+    const resolvedP1Choice = this.resolveChoiceForRequest(
+      requests.p1,
+      p1Choice
+    );
+    const resolvedP2Choice = this.resolveChoiceForRequest(
+      requests.p2,
+      p2Choice
+    );
 
     // Submit both choices for the same turn. Showdown resolves order internally.
     session.battle.choose('p1', resolvedP1Choice);
@@ -327,12 +336,15 @@ export class BattleService {
       .filter((species: DexSpeciesLike) => {
         if (!species?.exists) return false;
         if (!species.name || species.num <= 0) return false;
-        if (species.isNonstandard && species.isNonstandard !== null) return false;
+        if (species.isNonstandard && species.isNonstandard !== null)
+          return false;
         if (species.battleOnly) return false;
         if (q && !species.name.toLowerCase().includes(q)) return false;
         return true;
       })
-      .sort((a: DexSpeciesLike, b: DexSpeciesLike) => a.name.localeCompare(b.name))
+      .sort((a: DexSpeciesLike, b: DexSpeciesLike) =>
+        a.name.localeCompare(b.name)
+      )
       .slice(0, max)
       .map((species: DexSpeciesLike) => ({
         id: species.id,
@@ -348,7 +360,11 @@ export class BattleService {
   async getPokemonMoves(
     pokemonName: string,
     limit = 200
-  ): Promise<{ pokemon: string; moves: PokemonMoveItem[]; recommendedMoves: string[] }> {
+  ): Promise<{
+    pokemon: string;
+    moves: PokemonMoveItem[];
+    recommendedMoves: string[];
+  }> {
     const { Dex } = await import('pokemon-showdown');
     const species = Dex.species.get(pokemonName);
 
@@ -439,14 +455,18 @@ export class BattleService {
     }
 
     const legalMoves = await this.getPokemonMoves(species.name, 1000);
-    const legalById = new Map(legalMoves.moves.map((move) => [move.id, move.name]));
+    const legalById = new Map(
+      legalMoves.moves.map((move) => [move.id, move.name])
+    );
 
     const requestedMoves = (input.selectedMoves || [])
       .map((move) => Dex.moves.get(move))
       .filter((move: DexMoveLike) => move?.exists);
 
     const dedupRequested = Array.from(
-      new Map(requestedMoves.map((move: DexMoveLike) => [move.id, move])).values()
+      new Map(
+        requestedMoves.map((move: DexMoveLike) => [move.id, move])
+      ).values()
     );
 
     for (const move of dedupRequested) {
@@ -464,7 +484,9 @@ export class BattleService {
     const finalMoveNames = [
       ...dedupRequested.map((move: DexMoveLike) => move.name),
       ...fallbackMoves
-        .filter((move) => !dedupRequested.some((m: DexMoveLike) => m.id === move.id))
+        .filter(
+          (move) => !dedupRequested.some((m: DexMoveLike) => m.id === move.id)
+        )
         .map((move) => move.name),
     ].slice(0, 4);
 
@@ -474,9 +496,10 @@ export class BattleService {
 
     const abilities = species.abilities as unknown as Record<string, string>;
     const ability = abilities['0'] || Object.values(abilities)[0] || 'None';
-    const level = input.level && Number.isFinite(input.level)
-      ? Math.max(1, Math.min(100, Math.floor(input.level)))
-      : tierToAutoLevel(species.tier);
+    const level =
+      input.level && Number.isFinite(input.level)
+        ? Math.max(1, Math.min(100, Math.floor(input.level)))
+        : tierToAutoLevel(species.tier);
 
     const set = {
       name: species.name,
@@ -518,9 +541,12 @@ export class BattleService {
       !input.fallbackSpecies;
 
     if (shouldGenerateRandomTeam) {
-      const randomSets = Teams.generate(input.randomTeamFormatid ?? 'gen9randombattle', {
-        seed: this.normalizeSeed(input.randomSeed),
-      }).slice(0, targetSize) as PokemonSetLike[];
+      const randomSets = Teams.generate(
+        input.randomTeamFormatid ?? 'gen9randombattle',
+        {
+          seed: this.normalizeSeed(input.randomSeed),
+        }
+      ).slice(0, targetSize) as PokemonSetLike[];
 
       return {
         packed: Teams.pack(randomSets),
@@ -597,7 +623,9 @@ export class BattleService {
 
     const moveChoices = this.getLegalMoveChoices(request);
     const switchChoices = this.getLegalSwitchChoices(request);
-    const allChoices = forceSwitch ? switchChoices : [...moveChoices, ...switchChoices];
+    const allChoices = forceSwitch
+      ? switchChoices
+      : [...moveChoices, ...switchChoices];
 
     return {
       needsChoice: true,
@@ -624,7 +652,9 @@ export class BattleService {
       baseStats?: { atk: number; spa: number };
     }
   ): PokemonMoveItem[] {
-    const unique = Array.from(new Map(moves.map((move) => [move.id, move])).values());
+    const unique = Array.from(
+      new Map(moves.map((move) => [move.id, move])).values()
+    );
     const typeSet = new Set(context.types || []);
     const atk = context.baseStats?.atk ?? 80;
     const spa = context.baseStats?.spa ?? 80;
@@ -635,29 +665,34 @@ export class BattleService {
         move,
         score: this.scoreMove(move, { typeSet, preferredCategory }),
       }))
-      .sort((a, b) => b.score - a.score || a.move.name.localeCompare(b.move.name));
+      .sort(
+        (a, b) => b.score - a.score || a.move.name.localeCompare(b.move.name)
+      );
 
     const chosen: PokemonMoveItem[] = [];
     const usedIds = new Set<string>();
 
     const pick = (predicate: (move: PokemonMoveItem) => boolean) => {
-      const found = scored.find(({ move }) => !usedIds.has(move.id) && predicate(move));
+      const found = scored.find(
+        ({ move }) => !usedIds.has(move.id) && predicate(move)
+      );
       if (!found) return;
       usedIds.add(found.move.id);
       chosen.push(found.move);
     };
 
     // Prefer one strong STAB move in the preferred attacking category
-    pick((move) =>
-      move.basePower > 0 &&
-      move.category === preferredCategory &&
-      typeSet.has(move.type)
+    pick(
+      (move) =>
+        move.basePower > 0 &&
+        move.category === preferredCategory &&
+        typeSet.has(move.type)
     );
 
     // Add coverage move of a different type
-    pick((move) =>
-      move.basePower > 0 &&
-      (!chosen[0] || move.type !== chosen[0].type)
+    pick(
+      (move) =>
+        move.basePower > 0 && (!chosen[0] || move.type !== chosen[0].type)
     );
 
     // Add best setup/status/support move if available
@@ -667,11 +702,11 @@ export class BattleService {
     while (chosen.length < 4) {
       const currentTypes = new Set(chosen.map((m) => m.type));
       const found =
-        scored.find(({ move }) =>
-          !usedIds.has(move.id) &&
-          (move.basePower === 0 || !currentTypes.has(move.type))
-        ) ||
-        scored.find(({ move }) => !usedIds.has(move.id));
+        scored.find(
+          ({ move }) =>
+            !usedIds.has(move.id) &&
+            (move.basePower === 0 || !currentTypes.has(move.type))
+        ) || scored.find(({ move }) => !usedIds.has(move.id));
 
       if (!found) break;
       usedIds.add(found.move.id);
@@ -687,7 +722,11 @@ export class BattleService {
   ): number {
     const isDamaging = move.basePower > 0;
     const accuracy =
-      move.accuracy === true ? 100 : typeof move.accuracy === 'number' ? move.accuracy : 100;
+      move.accuracy === true
+        ? 100
+        : typeof move.accuracy === 'number'
+        ? move.accuracy
+        : 100;
     const stabBonus = context.typeSet.has(move.type) ? 20 : 0;
     const categoryBonus = move.category === context.preferredCategory ? 10 : 0;
     const priorityBonus = Math.max(0, move.priority) * 8;
@@ -744,7 +783,10 @@ export class BattleService {
     return JSON.parse(JSON.stringify(request)) as ShowdownRequest;
   }
 
-  private resolveChoiceForRequest(request: ShowdownRequest, requestedChoice: string): string {
+  private resolveChoiceForRequest(
+    request: ShowdownRequest,
+    requestedChoice: string
+  ): string {
     if (request.wait) return 'default';
 
     if (request.teamPreview) {
@@ -774,7 +816,9 @@ export class BattleService {
     if (normalized && normalized !== 'default') {
       const kind = legalOptions.forceSwitch ? 'forced switch' : 'action';
       throw new BadRequestException(
-        `Invalid ${kind} choice "${normalized}". Legal choices: ${legalOptions.allChoices.join(', ')}`
+        `Invalid ${kind} choice "${normalized}". Legal choices: ${legalOptions.allChoices.join(
+          ', '
+        )}`
       );
     }
 
@@ -809,7 +853,9 @@ export class BattleService {
 
   private isFainted(pokemon: ShowdownRequestSidePokemon): boolean {
     if (pokemon.fainted) return true;
-    return typeof pokemon.condition === 'string' && pokemon.condition.includes('fnt');
+    return (
+      typeof pokemon.condition === 'string' && pokemon.condition.includes('fnt')
+    );
   }
 
   private normalizeTeamInputs(
@@ -838,11 +884,15 @@ export class BattleService {
     return normalized.slice(0, maxSize);
   }
 
-  private normalizeSeed(seed: number[] | undefined): [number, number, number, number] | undefined {
+  private normalizeSeed(
+    seed: number[] | undefined
+  ): [number, number, number, number] | undefined {
     if (!Array.isArray(seed) || seed.length !== 4) {
       return undefined;
     }
-    const values = seed.map((value) => Math.max(0, Math.floor(Number(value) || 0)));
+    const values = seed.map((value) =>
+      Math.max(0, Math.floor(Number(value) || 0))
+    );
     if (values.some((value) => !Number.isFinite(value))) {
       return undefined;
     }
@@ -988,7 +1038,10 @@ export class BattleService {
       const moveSlots = active?.moveSlots || [];
 
       return moveSlots
-        .map((move: BattleMoveSlotLike, index: number) => ({ move, index: index + 1 }))
+        .map((move: BattleMoveSlotLike, index: number) => ({
+          move,
+          index: index + 1,
+        }))
         .filter(({ move }) => !move.disabled && move.pp > 0)
         .map(({ index }) => index);
     } catch {
