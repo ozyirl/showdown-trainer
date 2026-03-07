@@ -5,20 +5,20 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import type { Battle } from 'pokemon-showdown';
+import { Observable } from 'rxjs';
 import {
   BattleService,
   StartBattleRequest,
   type ShowdownLegalOptions,
   type ShowdownRequest,
 } from './battle.service';
-import {
-  CpuMoveAiService,
-} from './cpu-move-ai.service';
+import { CpuMoveAiService, type CpuStreamEvent } from './cpu-move-ai.service';
 
 export interface BattlePokemonState {
   slot: number;
   ident: string;
   name: string;
+  level: number;
   hp: number;
   maxHp: number;
   hpPercent: number;
@@ -47,6 +47,7 @@ export interface BattleState {
   // Backward-compatible active snapshots.
   p1Pokemon: {
     name: string;
+    level: number;
     hp: number;
     maxHp: number;
     hpPercent: number;
@@ -58,6 +59,7 @@ export interface BattleState {
   };
   p2Pokemon: {
     name: string;
+    level: number;
     hp: number;
     maxHp: number;
     hpPercent: number;
@@ -82,6 +84,7 @@ export interface BattleState {
     choice: string;
     slot: number;
     name: string;
+    level: number;
     hp: number;
     maxHp: number;
     hpPercent: number;
@@ -291,6 +294,40 @@ export class BattleSessionManager {
     private readonly cpuMoveAiService: CpuMoveAiService
   ) {}
 
+  getSessionForCopilot(battleId: string): {
+    battle: BattleWithDex;
+    session: {
+      currentTurn: number;
+      turnLog: string[];
+      lastTurnEvents: BattleTurnEvent[];
+      phase: string;
+    };
+    battleService: BattleService;
+  } {
+    const session = this.sessions.get(battleId);
+    if (!session) {
+      throw new NotFoundException('Battle not found');
+    }
+    return {
+      battle: session.battle as unknown as BattleWithDex,
+      session: {
+        currentTurn: session.currentTurn,
+        turnLog: session.turnLog,
+        lastTurnEvents: session.lastTurnEvents,
+        phase: session.phase,
+      },
+      battleService: this.battleService,
+    };
+  }
+
+  getCpuStream(battleId: string): Observable<CpuStreamEvent> {
+    const session = this.sessions.get(battleId);
+    if (!session) {
+      throw new NotFoundException('Battle not found');
+    }
+    return this.cpuMoveAiService.getBattleStream(battleId).asObservable();
+  }
+
   async createBattle(config?: StartBattleRequest): Promise<BattleState> {
     const { Battle } = await import('pokemon-showdown');
 
@@ -331,11 +368,17 @@ export class BattleSessionManager {
 
     battle.choose(
       'p1',
-      this.normalizeTeamPreviewChoice(config?.p1TeamPreviewChoice, p1Built.members.length)
+      this.normalizeTeamPreviewChoice(
+        config?.p1TeamPreviewChoice,
+        p1Built.members.length
+      )
     );
     battle.choose(
       'p2',
-      this.normalizeTeamPreviewChoice(config?.p2TeamPreviewChoice, p2Built.members.length)
+      this.normalizeTeamPreviewChoice(
+        config?.p2TeamPreviewChoice,
+        p2Built.members.length
+      )
     );
 
     const battleId = `battle_${Date.now()}_${Math.random()
@@ -364,7 +407,10 @@ export class BattleSessionManager {
           turn: session.currentTurn,
           type: 'TURN_START',
           timestamp: Date.now(),
-          payload: { turn: session.currentTurn, text: `Turn ${session.currentTurn}` },
+          payload: {
+            turn: session.currentTurn,
+            text: `Turn ${session.currentTurn}`,
+          },
         },
       });
       this.enqueueRequestBoundaryEvents(session, initialRequests);
@@ -526,7 +572,9 @@ export class BattleSessionManager {
     if (session.awaitingAckEventSeq !== null) {
       session.phase = 'awaiting-event-ack';
     } else if (!session.battle.ended) {
-      session.phase = this.derivePhaseFromRequests(this.battleService.getRequests(battleId));
+      session.phase = this.derivePhaseFromRequests(
+        this.battleService.getRequests(battleId)
+      );
     } else {
       session.phase = 'ended';
     }
@@ -534,7 +582,11 @@ export class BattleSessionManager {
     return this.getBattleState(battleId);
   }
 
-  getBattleEvents(battleId: string, afterSeq = 0, limit = 200): BattlePlaybackEvent[] {
+  getBattleEvents(
+    battleId: string,
+    afterSeq = 0,
+    limit = 200
+  ): BattlePlaybackEvent[] {
     const session = this.sessions.get(battleId);
     if (!session) {
       throw new NotFoundException('Battle not found');
@@ -561,7 +613,9 @@ export class BattleSessionManager {
       const p2Choice = session.p2Choice ?? this.pickDefaultChoice(p2Legal);
       const resolutionKey = `${session.currentTurn}|${session.lastLogIndex}|${p1Choice}|${p2Choice}`;
       if (session.lastResolutionKey === resolutionKey) {
-        throw new ConflictException('Duplicate resolution attempt blocked by idempotency guard');
+        throw new ConflictException(
+          'Duplicate resolution attempt blocked by idempotency guard'
+        );
       }
       session.lastResolutionKey = resolutionKey;
 
@@ -578,17 +632,30 @@ export class BattleSessionManager {
       // before enqueueing new events. This ensures end-of-turn effects that
       // happened after a faint appear before the replacement switch-in.
       if (session.deferredTurnEvents.length > 0) {
-        this.enqueueEventsFromList(session, session.deferredTurnEvents, session.currentTurn);
+        this.enqueueEventsFromList(
+          session,
+          session.deferredTurnEvents,
+          session.currentTurn
+        );
         session.deferredTurnEvents = [];
       }
 
       // Determine if a forced switch is needed so we can defer post-faint
       // end-of-turn effects until the switch is resolved.
-      const postP1Legal = this.battleService.getLegalOptionsForRequest(stepResult.requests.p1);
-      const postP2Legal = this.battleService.getLegalOptionsForRequest(stepResult.requests.p2);
-      const forceSwitchNeeded = postP1Legal.forceSwitch || postP2Legal.forceSwitch;
+      const postP1Legal = this.battleService.getLegalOptionsForRequest(
+        stepResult.requests.p1
+      );
+      const postP2Legal = this.battleService.getLegalOptionsForRequest(
+        stepResult.requests.p2
+      );
+      const forceSwitchNeeded =
+        postP1Legal.forceSwitch || postP2Legal.forceSwitch;
 
-      this.enqueuePlaybackEvents(session, session.lastTurnEvents, forceSwitchNeeded);
+      this.enqueuePlaybackEvents(
+        session,
+        session.lastTurnEvents,
+        forceSwitchNeeded
+      );
 
       session.lastLogIndex = session.battle.log.length;
       session.currentTurn =
@@ -683,6 +750,7 @@ export class BattleSessionManager {
       },
       p1Pokemon: {
         name: p1Side.active?.name || 'Unknown',
+        level: p1Side.active?.level || 100,
         hp: p1Side.active?.hp || 0,
         maxHp: p1Side.active?.maxHp || 100,
         hpPercent: p1Side.active?.hpPercent || 0,
@@ -694,6 +762,7 @@ export class BattleSessionManager {
       },
       p2Pokemon: {
         name: p2Side.active?.name || 'Unknown',
+        level: p2Side.active?.level || 100,
         hp: p2Side.active?.hp || 0,
         maxHp: p2Side.active?.maxHp || 100,
         hpPercent: p2Side.active?.hpPercent || 0,
@@ -728,9 +797,13 @@ export class BattleSessionManager {
   deleteBattle(battleId: string) {
     this.sessions.delete(battleId);
     this.battleService.unregisterBattleSession(battleId);
+    this.cpuMoveAiService.clearBattleStream(battleId);
   }
 
-  private normalizeTeamPreviewChoice(choice: string | undefined, teamSize: number): string {
+  private normalizeTeamPreviewChoice(
+    choice: string | undefined,
+    teamSize: number
+  ): string {
     const fallback = `team ${Array.from(
       { length: Math.max(1, Math.min(6, teamSize || 6)) },
       (_, index) => index + 1
@@ -742,7 +815,10 @@ export class BattleSessionManager {
     return normalized;
   }
 
-  private seedForSide(seed: number[] | undefined, sideOffset: number): number[] | undefined {
+  private seedForSide(
+    seed: number[] | undefined,
+    sideOffset: number
+  ): number[] | undefined {
     if (!Array.isArray(seed) || seed.length !== 4) return undefined;
     return seed.map((value, index) =>
       Math.max(0, Math.floor(Number(value) || 0) + sideOffset + index)
@@ -828,7 +904,9 @@ export class BattleSessionManager {
     forceSwitchNeeded: boolean
   ): void {
     const currentTurn = session.currentTurn;
-    const lastFaintIdx = forceSwitchNeeded ? this.findLastFaintIndex(turnEvents) : -1;
+    const lastFaintIdx = forceSwitchNeeded
+      ? this.findLastFaintIndex(turnEvents)
+      : -1;
     const stepSeenKeys = new Set<string>();
 
     for (let i = 0; i < turnEvents.length; i++) {
@@ -837,7 +915,9 @@ export class BattleSessionManager {
       // TURN marker → emit TURN_END for ending turn then TURN_START for new turn.
       // This replaces the raw TURN event so boundary ordering is always correct.
       if (event.kind === 'turn') {
-        const nextTurn = Number((event.text.match(/\d+/) || [])[0] || currentTurn + 1);
+        const nextTurn = Number(
+          (event.text.match(/\d+/) || [])[0] || currentTurn + 1
+        );
         const endedTurn = Math.max(1, nextTurn - 1);
 
         this.enqueueBoundaryEvent(session, {
@@ -868,7 +948,11 @@ export class BattleSessionManager {
       // forced switch is pending. They will be flushed before the next step's
       // events so the UI sees: FAINT → REQUEST_SWITCH → (switch resolved) →
       // deferred effects → SWITCH_IN → TURN_END → TURN_START → REQUEST_MOVE.
-      if (lastFaintIdx >= 0 && i > lastFaintIdx && this.isEndOfTurnEffect(event)) {
+      if (
+        lastFaintIdx >= 0 &&
+        i > lastFaintIdx &&
+        this.isEndOfTurnEffect(event)
+      ) {
         session.deferredTurnEvents.push(event);
         continue;
       }
@@ -937,16 +1021,27 @@ export class BattleSessionManager {
     const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
 
     // REQUEST_SWITCH — emitted when a side must choose a replacement.
-    const switchRequests: Array<{ player: 'p1' | 'p2'; legalChoices: string[] }> = [];
+    const switchRequests: Array<{
+      player: 'p1' | 'p2';
+      legalChoices: string[];
+    }> = [];
     if (p1Legal.forceSwitch) {
-      switchRequests.push({ player: 'p1', legalChoices: p1Legal.switchChoices });
+      switchRequests.push({
+        player: 'p1',
+        legalChoices: p1Legal.switchChoices,
+      });
     }
     if (p2Legal.forceSwitch) {
-      switchRequests.push({ player: 'p2', legalChoices: p2Legal.switchChoices });
+      switchRequests.push({
+        player: 'p2',
+        legalChoices: p2Legal.switchChoices,
+      });
     }
     if (switchRequests.length > 0) {
       this.enqueueBoundaryEvent(session, {
-        dedupeKey: `request-switch:${turnValue}:${switchRequests.map((r) => r.player).join(',')}`,
+        dedupeKey: `request-switch:${turnValue}:${switchRequests
+          .map((r) => r.player)
+          .join(',')}`,
         event: {
           seq: session.nextEventSeq++,
           turn: turnValue,
@@ -964,7 +1059,8 @@ export class BattleSessionManager {
     // REQUEST_MOVE — only when no forced switch is pending.
     // Stable dedup key: just turn number (legal choices may shift between
     // re-evaluations, but the conceptual "please choose a move" is the same).
-    const moveRequests: Array<{ player: 'p1' | 'p2'; legalChoices: string[] }> = [];
+    const moveRequests: Array<{ player: 'p1' | 'p2'; legalChoices: string[] }> =
+      [];
     if (p1Legal.moveChoices.length > 0) {
       moveRequests.push({ player: 'p1', legalChoices: p1Legal.moveChoices });
     }
@@ -1025,10 +1121,15 @@ export class BattleSessionManager {
     );
   }
 
-  private createEffectIdempotencyKey(turn: number, event: BattleTurnEvent): string | null {
+  private createEffectIdempotencyKey(
+    turn: number,
+    event: BattleTurnEvent
+  ): string | null {
     if (!event.sourceType || !event.target) return null;
     if (event.kind !== 'heal' && event.kind !== 'damage') return null;
-    return `effect:${turn}:${event.kind}:${event.target}:${event.sourceType}:${event.sourceName || ''}`;
+    return `effect:${turn}:${event.kind}:${event.target}:${event.sourceType}:${
+      event.sourceName || ''
+    }`;
   }
 
   private enqueueEventsFromList(
@@ -1076,7 +1177,9 @@ export class BattleSessionManager {
     }
   }
 
-  private mapTurnEventType(event: BattleTurnEvent): BattlePlaybackEvent['type'] {
+  private mapTurnEventType(
+    event: BattleTurnEvent
+  ): BattlePlaybackEvent['type'] {
     if (event.kind === 'heal') {
       if (event.sourceType === 'item') return 'ITEM_HEAL';
       if (event.sourceType === 'ability') return 'ABILITY_HEAL';
@@ -1174,7 +1277,10 @@ export class BattleSessionManager {
     ].join('|');
   }
 
-  private playerNeedsChoice(player: 'p1' | 'p2', legal: ShowdownLegalOptions): boolean {
+  private playerNeedsChoice(
+    player: 'p1' | 'p2',
+    legal: ShowdownLegalOptions
+  ): boolean {
     if (!legal.needsChoice || legal.wait) return false;
     if (player === 'p2' && !legal.allChoices.length) return false;
     return true;
@@ -1202,8 +1308,10 @@ export class BattleSessionManager {
     const p1Legal = this.battleService.getLegalOptionsForRequest(requests.p1);
     const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
 
-    const p1Ready = !this.playerNeedsChoice('p1', p1Legal) || session.hasChoice('p1');
-    const p2Ready = !this.playerNeedsChoice('p2', p2Legal) || session.hasChoice('p2');
+    const p1Ready =
+      !this.playerNeedsChoice('p1', p1Legal) || session.hasChoice('p1');
+    const p2Ready =
+      !this.playerNeedsChoice('p2', p2Legal) || session.hasChoice('p2');
     return p1Ready && p2Ready;
   }
 
@@ -1235,7 +1343,11 @@ export class BattleSessionManager {
     const battle = session.battle as unknown as BattleWithDex;
     const p1Active = battle.sides?.[0]?.active?.[0];
     const p2Active = battle.sides?.[1]?.active?.[0];
-    const p2MoveChoices = this.getLegalCpuMoveChoices(battle, requests, p2Legal);
+    const p2MoveChoices = this.getLegalCpuMoveChoices(
+      battle,
+      requests,
+      p2Legal
+    );
     const p2SwitchChoices = this.getLegalCpuSwitchChoices(requests.p2, p2Legal);
 
     if (!this.isCpuAiEnabled()) {
@@ -1267,8 +1379,12 @@ export class BattleSessionManager {
         availableMoves: p2MoveChoices,
         availableSwitches: p2SwitchChoices,
         recentLog: session.turnLog.slice(-4),
-        cpuPokemonTypes: this.getPokemonTypes(session.battle.sides[1]?.active?.[0]),
-        playerPokemonTypes: this.getPokemonTypes(session.battle.sides[0]?.active?.[0]),
+        cpuPokemonTypes: this.getPokemonTypes(
+          session.battle.sides[1]?.active?.[0]
+        ),
+        playerPokemonTypes: this.getPokemonTypes(
+          session.battle.sides[0]?.active?.[0]
+        ),
       });
       session.setChoice('p2', decision.choice);
       session.lastCpuDecision = {
@@ -1297,7 +1413,7 @@ export class BattleSessionManager {
         choice: fallback.choice,
         actionType: fallback.actionType,
         source: 'fallback',
-        modelId: process.env.OPENAI_CPU_MODEL || 'gpt-4.1-mini',
+        modelId: process.env.OPENAI_CPU_MODEL || 'gpt-5-nano-2025-08-07',
         latencyMs: 0,
         reasoning: 'Fallback action after agent error',
         error: message,
@@ -1333,7 +1449,8 @@ export class BattleSessionManager {
     return moveRequests
       .map((move, index) => ({ move, index: index + 1 }))
       .filter(
-        ({ index, move }) => legalMoveIndices.has(index) && (move.pp ?? 1) > 0 && !move.disabled
+        ({ index, move }) =>
+          legalMoveIndices.has(index) && (move.pp ?? 1) > 0 && !move.disabled
       )
       .map(({ move, index }) => {
         const dexMove = battle.dex?.moves?.get?.(move.id || move.move);
@@ -1367,7 +1484,12 @@ export class BattleSessionManager {
   private getLegalCpuSwitchChoices(
     request: ShowdownRequest,
     p2Legal: ShowdownLegalOptions
-  ): Array<{ slot: number; name: string; hpPercent: number; status?: string | null }> {
+  ): Array<{
+    slot: number;
+    name: string;
+    hpPercent: number;
+    status?: string | null;
+  }> {
     const legalSwitchSlots = new Set(
       p2Legal.switchChoices
         .map((choice) => {
@@ -1399,7 +1521,11 @@ export class BattleSessionManager {
       effectivenessMultiplier?: number;
       isImmune?: boolean;
     }>,
-    switchChoices: Array<{ slot: number; hpPercent: number; status?: string | null }>,
+    switchChoices: Array<{
+      slot: number;
+      hpPercent: number;
+      status?: string | null;
+    }>,
     forceSwitch: boolean
   ): { choice: string; actionType: 'move' | 'switch' | 'default' } {
     if (forceSwitch || moveChoices.length === 0) {
@@ -1439,7 +1565,9 @@ export class BattleSessionManager {
   }
 
   private getPokemonTypes(pokemon: unknown): string[] | undefined {
-    const p = pokemon as { types?: string[]; getTypes?: () => string[] } | undefined;
+    const p = pokemon as
+      | { types?: string[]; getTypes?: () => string[] }
+      | undefined;
     if (!p) return undefined;
     if (Array.isArray(p.types) && p.types.length > 0) return p.types;
     try {
@@ -1450,22 +1578,33 @@ export class BattleSessionManager {
     }
   }
 
-  private buildSideState(side: BattleSideLike | undefined, request: ShowdownRequest): BattleSideState {
+  private buildSideState(
+    side: BattleSideLike | undefined,
+    request: ShowdownRequest
+  ): BattleSideState {
     const activeBoosts = this.extractActiveBoosts(side);
     const activeTypes = this.getPokemonTypes(side?.active?.[0]) ?? null;
 
     const source = side?.pokemon?.length
       ? side.pokemon.map((pokemon) => ({
-          ident: pokemon.fullname || pokemon.name || `slot-${(pokemon.position ?? 0) + 1}`,
+          ident:
+            pokemon.fullname ||
+            pokemon.name ||
+            `slot-${(pokemon.position ?? 0) + 1}`,
           name: pokemon.name || pokemon.species?.name || 'Unknown',
+          level: typeof pokemon.level === 'number' ? pokemon.level : 100,
           slot: (pokemon.position ?? 0) + 1,
           hp: typeof pokemon.hp === 'number' ? pokemon.hp : 0,
           maxHp: typeof pokemon.maxhp === 'number' ? pokemon.maxhp : 0,
           status: pokemon.status || null,
           fainted: !!pokemon.fainted,
           isActive: !!pokemon.isActive,
-          item: pokemon.item ? (pokemon.set?.item || pokemon.item) : null,
-          ability: pokemon.set?.ability || pokemon.ability || pokemon.baseAbility || null,
+          item: pokemon.item ? pokemon.set?.item || pokemon.item : null,
+          ability:
+            pokemon.set?.ability ||
+            pokemon.ability ||
+            pokemon.baseAbility ||
+            null,
           boosts: pokemon.isActive ? activeBoosts : null,
           types: pokemon.isActive ? activeTypes : null,
         }))
@@ -1489,15 +1628,16 @@ export class BattleSessionManager {
     };
   }
 
-  private buildTeamFromRequest(request: ShowdownRequest): Array<
-    Omit<BattlePokemonState, 'hpPercent'>
-  > {
+  private buildTeamFromRequest(
+    request: ShowdownRequest
+  ): Array<Omit<BattlePokemonState, 'hpPercent'>> {
     return (request.side?.pokemon ?? []).map((pokemon, index) => {
       const parsed = this.parseCondition(pokemon.condition);
       return {
         slot: index + 1,
         ident: pokemon.ident || `slot-${index + 1}`,
         name: this.extractNameFromIdent(pokemon.ident, pokemon.details),
+        level: this.extractLevelFromDetails(pokemon.details),
         hp: parsed.hp,
         maxHp: parsed.maxHp,
         status: parsed.status,
@@ -1511,7 +1651,9 @@ export class BattleSessionManager {
     });
   }
 
-  private extractActiveBoosts(side: BattleSideLike | undefined): Record<string, number> | null {
+  private extractActiveBoosts(
+    side: BattleSideLike | undefined
+  ): Record<string, number> | null {
     const activePokemon = side?.active?.[0];
     if (!activePokemon?.boosts) return null;
     const nonZero: Record<string, number> = {};
@@ -1555,7 +1697,8 @@ export class BattleSessionManager {
           accuracy: dexMove?.accuracy ?? null,
           category: dexMove?.category ?? null,
           pp: move.pp ?? 0,
-          maxPp: battle.sides?.[0]?.active?.[0]?.moveSlots?.[index - 1]?.maxpp ??
+          maxPp:
+            battle.sides?.[0]?.active?.[0]?.moveSlots?.[index - 1]?.maxpp ??
             move.pp ??
             0,
         };
@@ -1581,6 +1724,7 @@ export class BattleSessionManager {
         choice: `switch ${pokemon.slot}`,
         slot: pokemon.slot,
         name: pokemon.name,
+        level: pokemon.level,
         hp: pokemon.hp,
         maxHp: pokemon.maxHp,
         hpPercent: pokemon.hpPercent,
@@ -1610,7 +1754,13 @@ export class BattleSessionManager {
     const fractionMatch = condition.match(/(\d+)\/(\d+)/);
     const statusMatch = condition.match(/\b(brn|psn|tox|par|slp|frz)\b/);
     if (!fractionMatch) {
-      return { hp: 0, maxHp: 0, hpPercent: 0, status: statusMatch?.[1] ?? null, fainted: false };
+      return {
+        hp: 0,
+        maxHp: 0,
+        hpPercent: 0,
+        status: statusMatch?.[1] ?? null,
+        fainted: false,
+      };
     }
 
     const hp = Number(fractionMatch[1]);
@@ -1632,6 +1782,12 @@ export class BattleSessionManager {
       return details.split(',')[0].trim();
     }
     return 'Unknown';
+  }
+
+  private extractLevelFromDetails(details?: string): number {
+    if (!details) return 100;
+    const match = details.match(/\bL(\d+)\b/);
+    return match ? Number(match[1]) : 100;
   }
 
   private toHpPercent(hp?: number, maxHp?: number): number {
@@ -1660,7 +1816,9 @@ export class BattleSessionManager {
           break;
         }
         case 'move':
-          formatted.push(`${parts[1]?.split(':')[1]?.trim()} used ${parts[2]}!`);
+          formatted.push(
+            `${parts[1]?.split(':')[1]?.trim()} used ${parts[2]}!`
+          );
           break;
         case '-damage': {
           const pokemon = parts[1]?.split(':')[1]?.trim();
@@ -1668,14 +1826,18 @@ export class BattleSessionManager {
             formatted.push(`${pokemon} fainted!`);
           } else {
             const ann = this.parseProtocolAnnotations(parts.slice(3));
-            formatted.push(this.buildDamageText(pokemon, undefined, null, null, ann));
+            formatted.push(
+              this.buildDamageText(pokemon, undefined, null, null, ann)
+            );
           }
           break;
         }
         case '-heal': {
           const pokemon = parts[1]?.split(':')[1]?.trim();
           const ann = this.parseProtocolAnnotations(parts.slice(3));
-          formatted.push(this.buildHealText(pokemon, undefined, null, null, ann));
+          formatted.push(
+            this.buildHealText(pokemon, undefined, null, null, ann)
+          );
           break;
         }
         case '-supereffective':
@@ -1707,7 +1869,10 @@ export class BattleSessionManager {
         }
         case '-activate': {
           const pokemon = parts[1]?.split(':')[1]?.trim();
-          const effect = (parts[2] || '').replace(/^move:\s*/i, '').replace(/^ability:\s*/i, '').trim();
+          const effect = (parts[2] || '')
+            .replace(/^move:\s*/i, '')
+            .replace(/^ability:\s*/i, '')
+            .trim();
           const eff = effect.toLowerCase();
           if (eff === 'confusion') {
             formatted.push(`${pokemon} is confused!`);
@@ -1730,7 +1895,12 @@ export class BattleSessionManager {
           const stat = parts[2] || '';
           const amount = Number(parts[3]) || 1;
           const statName = this.formatStatName(stat);
-          const desc = amount >= 3 ? 'rose drastically' : amount === 2 ? 'rose sharply' : 'rose';
+          const desc =
+            amount >= 3
+              ? 'rose drastically'
+              : amount === 2
+              ? 'rose sharply'
+              : 'rose';
           formatted.push(`${pokemon}'s ${statName} ${desc}!`);
           break;
         }
@@ -1739,7 +1909,12 @@ export class BattleSessionManager {
           const stat = parts[2] || '';
           const amount = Number(parts[3]) || 1;
           const statName = this.formatStatName(stat);
-          const desc = amount >= 3 ? 'fell severely' : amount === 2 ? 'fell harshly' : 'fell';
+          const desc =
+            amount >= 3
+              ? 'fell severely'
+              : amount === 2
+              ? 'fell harshly'
+              : 'fell';
           formatted.push(`${pokemon}'s ${statName} ${desc}!`);
           break;
         }
@@ -1752,8 +1927,12 @@ export class BattleSessionManager {
         case '-enditem': {
           const pokemon = parts[1]?.split(':')[1]?.trim();
           const itemName = parts[2] || '';
-          const eaten = parts.some(p => p === '[eat]');
-          formatted.push(eaten ? `${pokemon} ate its ${itemName}!` : `${pokemon} lost its ${itemName}!`);
+          const eaten = parts.some((p) => p === '[eat]');
+          formatted.push(
+            eaten
+              ? `${pokemon} ate its ${itemName}!`
+              : `${pokemon} lost its ${itemName}!`
+          );
           break;
         }
         case '-ability': {
@@ -1764,9 +1943,12 @@ export class BattleSessionManager {
         }
         case '-weather': {
           const weatherName = parts[1] || 'none';
-          const upkeep = parts.some(p => p === '[upkeep]');
+          const upkeep = parts.some((p) => p === '[upkeep]');
           if (weatherName === 'none') formatted.push('The weather cleared.');
-          else if (!upkeep) formatted.push(`The weather became ${this.formatWeatherName(weatherName)}!`);
+          else if (!upkeep)
+            formatted.push(
+              `The weather became ${this.formatWeatherName(weatherName)}!`
+            );
           break;
         }
         case '-immune': {
@@ -1777,14 +1959,16 @@ export class BattleSessionManager {
         case '-curestatus': {
           const pokemon = parts[1]?.split(':')[1]?.trim();
           const curedStatus = parts[2] || '';
-          formatted.push(`${pokemon} was cured of its ${this.formatStatusName(curedStatus)}!`);
+          formatted.push(
+            `${pokemon} was cured of its ${this.formatStatusName(curedStatus)}!`
+          );
           break;
         }
         case '-sidestart': {
           const sideRaw = parts[1] || '';
           const effectRaw = parts[2] || '';
           const effectName = effectRaw.replace(/^move:\s*/i, '').trim();
-          const side = sideRaw.includes('p1') ? 'your' : "the opposing";
+          const side = sideRaw.includes('p1') ? 'your' : 'the opposing';
           formatted.push(`${effectName} was set on ${side} side!`);
           break;
         }
@@ -1792,21 +1976,27 @@ export class BattleSessionManager {
           const sideRaw = parts[1] || '';
           const effectRaw = parts[2] || '';
           const effectName = effectRaw.replace(/^move:\s*/i, '').trim();
-          const side = sideRaw.includes('p1') ? 'your' : "the opposing";
+          const side = sideRaw.includes('p1') ? 'your' : 'the opposing';
           formatted.push(`${effectName} was removed from ${side} side!`);
           break;
         }
         case '-start': {
           const pokemon = parts[1]?.split(':')[1]?.trim();
           const effectRaw = parts[2] || '';
-          const effectName = effectRaw.replace(/^move:\s*/i, '').replace(/^ability:\s*/i, '').trim();
+          const effectName = effectRaw
+            .replace(/^move:\s*/i, '')
+            .replace(/^ability:\s*/i, '')
+            .trim();
           formatted.push(`${pokemon} is affected by ${effectName}!`);
           break;
         }
         case '-end': {
           const pokemon = parts[1]?.split(':')[1]?.trim();
           const effectRaw = parts[2] || '';
-          const effectName = effectRaw.replace(/^move:\s*/i, '').replace(/^ability:\s*/i, '').trim();
+          const effectName = effectRaw
+            .replace(/^move:\s*/i, '')
+            .replace(/^ability:\s*/i, '')
+            .trim();
           formatted.push(`${pokemon}'s ${effectName} ended.`);
           break;
         }
@@ -1825,7 +2015,9 @@ export class BattleSessionManager {
         case '-hitcount': {
           const target = parts[1]?.split(':')[1]?.trim();
           const count = Number(parts[2]) || 0;
-          formatted.push(`Hit ${target} ${count} time${count !== 1 ? 's' : ''}!`);
+          formatted.push(
+            `Hit ${target} ${count} time${count !== 1 ? 's' : ''}!`
+          );
           break;
         }
         case '-ohko':
@@ -1869,7 +2061,11 @@ export class BattleSessionManager {
         }
         case 'drag': {
           const target = parts[1]?.split(':')[1]?.trim();
-          events.push({ kind: 'drag', text: `${target} was dragged out.`, target });
+          events.push({
+            kind: 'drag',
+            text: `${target} was dragged out.`,
+            target,
+          });
           break;
         }
         case 'move': {
@@ -1903,7 +2099,13 @@ export class BattleSessionManager {
           if (parsed.fainted) {
             break;
           }
-          const dmgText = this.buildDamageText(target, deltaHp, parsed.currentHp, parsed.maxHp, annotations);
+          const dmgText = this.buildDamageText(
+            target,
+            deltaHp,
+            parsed.currentHp,
+            parsed.maxHp,
+            annotations
+          );
           events.push({
             kind: 'damage',
             text: dmgText,
@@ -1935,7 +2137,13 @@ export class BattleSessionManager {
             }
             hpByTarget.set(target, parsed.currentHp);
           }
-          const healText = this.buildHealText(target, deltaHp, parsed.currentHp, parsed.maxHp, annotations);
+          const healText = this.buildHealText(
+            target,
+            deltaHp,
+            parsed.currentHp,
+            parsed.maxHp,
+            annotations
+          );
           events.push({
             kind: 'heal',
             text: healText,
@@ -1967,7 +2175,10 @@ export class BattleSessionManager {
           events.push({ kind: 'effectiveness', text: "It's super effective!" });
           break;
         case '-resisted':
-          events.push({ kind: 'effectiveness', text: "It's not very effective..." });
+          events.push({
+            kind: 'effectiveness',
+            text: "It's not very effective...",
+          });
           break;
         case '-crit':
           events.push({ kind: 'crit', text: 'Critical hit!' });
@@ -2011,14 +2222,22 @@ export class BattleSessionManager {
         }
         case '-activate': {
           const actor = parts[1]?.split(':')[1]?.trim();
-          const effect = (parts[2] || '').replace(/^move:\s*/i, '').replace(/^ability:\s*/i, '').trim();
+          const effect = (parts[2] || '')
+            .replace(/^move:\s*/i, '')
+            .replace(/^ability:\s*/i, '')
+            .trim();
           const effectLower = effect.toLowerCase();
           let activateText: string;
           if (effectLower === 'confusion') {
             activateText = `${actor} is confused!`;
           } else if (effectLower === 'trapped') {
             activateText = `${actor} can't escape!`;
-          } else if (effectLower.includes('protect') || effectLower === 'baneful bunker' || effectLower === 'spiky shield' || effectLower === 'king\'s shield') {
+          } else if (
+            effectLower.includes('protect') ||
+            effectLower === 'baneful bunker' ||
+            effectLower === 'spiky shield' ||
+            effectLower === "king's shield"
+          ) {
             activateText = `${actor} protected itself!`;
           } else if (effectLower === 'substitute') {
             activateText = `The substitute took damage for ${actor}!`;
@@ -2027,7 +2246,10 @@ export class BattleSessionManager {
           } else if (effectLower === 'sturdy' || effectLower === 'disguise') {
             activateText = `${actor}'s ${effect} activated!`;
           } else {
-            activateText = actor && effect ? `${actor}'s ${effect} activated!` : 'An effect activated.';
+            activateText =
+              actor && effect
+                ? `${actor}'s ${effect} activated!`
+                : 'An effect activated.';
           }
           events.push({
             kind: 'activate',
@@ -2062,7 +2284,12 @@ export class BattleSessionManager {
           const stat = parts[2] || '';
           const amount = Number(parts[3]) || 1;
           const statName = this.formatStatName(stat);
-          const desc = amount >= 3 ? 'rose drastically' : amount === 2 ? 'rose sharply' : 'rose';
+          const desc =
+            amount >= 3
+              ? 'rose drastically'
+              : amount === 2
+              ? 'rose sharply'
+              : 'rose';
           events.push({
             kind: 'boost',
             text: `${target}'s ${statName} ${desc}!`,
@@ -2077,7 +2304,12 @@ export class BattleSessionManager {
           const stat = parts[2] || '';
           const amount = Number(parts[3]) || 1;
           const statName = this.formatStatName(stat);
-          const desc = amount >= 3 ? 'fell severely' : amount === 2 ? 'fell harshly' : 'fell';
+          const desc =
+            amount >= 3
+              ? 'fell severely'
+              : amount === 2
+              ? 'fell harshly'
+              : 'fell';
           events.push({
             kind: 'unboost',
             text: `${target}'s ${statName} ${desc}!`,
@@ -2108,7 +2340,7 @@ export class BattleSessionManager {
           const target = parts[1]?.split(':')[1]?.trim();
           const itemName = parts[2] || '';
           const annotations = this.parseProtocolAnnotations(parts.slice(3));
-          const eaten = parts.some(p => p === '[eat]');
+          const eaten = parts.some((p) => p === '[eat]');
           events.push({
             kind: 'enditem',
             text: eaten
@@ -2140,13 +2372,27 @@ export class BattleSessionManager {
         }
         case '-weather': {
           const weatherName = parts[1] || 'none';
-          const upkeep = parts.some(p => p === '[upkeep]');
+          const upkeep = parts.some((p) => p === '[upkeep]');
           if (weatherName === 'none') {
-            events.push({ kind: 'weather', text: 'The weather cleared.', effectName: 'none' });
+            events.push({
+              kind: 'weather',
+              text: 'The weather cleared.',
+              effectName: 'none',
+            });
           } else if (upkeep) {
-            events.push({ kind: 'weather', text: `The ${this.formatWeatherName(weatherName)} continues.`, effectName: weatherName });
+            events.push({
+              kind: 'weather',
+              text: `The ${this.formatWeatherName(weatherName)} continues.`,
+              effectName: weatherName,
+            });
           } else {
-            events.push({ kind: 'weather', text: `The weather became ${this.formatWeatherName(weatherName)}!`, effectName: weatherName });
+            events.push({
+              kind: 'weather',
+              text: `The weather became ${this.formatWeatherName(
+                weatherName
+              )}!`,
+              effectName: weatherName,
+            });
           }
           break;
         }
@@ -2164,7 +2410,9 @@ export class BattleSessionManager {
           const curedStatus = parts[2] || '';
           events.push({
             kind: 'curestatus',
-            text: `${target} was cured of its ${this.formatStatusName(curedStatus)}!`,
+            text: `${target} was cured of its ${this.formatStatusName(
+              curedStatus
+            )}!`,
             target,
             status: curedStatus,
           });
@@ -2186,7 +2434,9 @@ export class BattleSessionManager {
           const effectName = effectRaw.replace(/^move:\s*/i, '').trim();
           events.push({
             kind: 'sidestart',
-            text: `${effectName} was set on ${side === 'p1' ? 'your' : "the opposing"} side!`,
+            text: `${effectName} was set on ${
+              side === 'p1' ? 'your' : 'the opposing'
+            } side!`,
             effectName,
             actor: sideRaw.split(':')[1]?.trim(),
           });
@@ -2199,7 +2449,9 @@ export class BattleSessionManager {
           const effectName = effectRaw.replace(/^move:\s*/i, '').trim();
           events.push({
             kind: 'sideend',
-            text: `${effectName} was removed from ${side === 'p1' ? 'your' : "the opposing"} side!`,
+            text: `${effectName} was removed from ${
+              side === 'p1' ? 'your' : 'the opposing'
+            } side!`,
             effectName,
             actor: sideRaw.split(':')[1]?.trim(),
           });
@@ -2208,7 +2460,10 @@ export class BattleSessionManager {
         case '-start': {
           const target = parts[1]?.split(':')[1]?.trim();
           const effectRaw = parts[2] || '';
-          const effectName = effectRaw.replace(/^move:\s*/i, '').replace(/^ability:\s*/i, '').trim();
+          const effectName = effectRaw
+            .replace(/^move:\s*/i, '')
+            .replace(/^ability:\s*/i, '')
+            .trim();
           events.push({
             kind: 'start',
             text: `${target} is affected by ${effectName}!`,
@@ -2220,7 +2475,10 @@ export class BattleSessionManager {
         case '-end': {
           const target = parts[1]?.split(':')[1]?.trim();
           const effectRaw = parts[2] || '';
-          const effectName = effectRaw.replace(/^move:\s*/i, '').replace(/^ability:\s*/i, '').trim();
+          const effectName = effectRaw
+            .replace(/^move:\s*/i, '')
+            .replace(/^ability:\s*/i, '')
+            .trim();
           events.push({
             kind: 'end',
             text: `${target}'s ${effectName} ended.`,
@@ -2295,7 +2553,9 @@ export class BattleSessionManager {
           const amount = Number(parts[3]) || 0;
           events.push({
             kind: 'boost',
-            text: `${target}'s ${this.formatStatName(stat)} was set to ${amount > 0 ? '+' : ''}${amount}!`,
+            text: `${target}'s ${this.formatStatName(stat)} was set to ${
+              amount > 0 ? '+' : ''
+            }${amount}!`,
             target,
             stat,
             amount,
@@ -2355,7 +2615,9 @@ export class BattleSessionManager {
           const stone = parts[3] || '';
           events.push({
             kind: 'activate',
-            text: stone ? `${actor} Mega Evolved using ${stone}!` : `${actor} Mega Evolved!`,
+            text: stone
+              ? `${actor} Mega Evolved using ${stone}!`
+              : `${actor} Mega Evolved!`,
             actor,
           });
           break;
@@ -2437,20 +2699,25 @@ export class BattleSessionManager {
     deltaHp: number | undefined,
     currentHp: number | null | undefined,
     maxHp: number | null | undefined,
-    annotations: { sourceType?: string; sourceName?: string | null },
+    annotations: { sourceType?: string; sourceName?: string | null }
   ): string {
     const name = target || 'The Pokémon';
-    const hpTag = typeof currentHp === 'number' && typeof maxHp === 'number'
-      ? ` (${currentHp}/${maxHp})`
-      : '';
+    const hpTag =
+      typeof currentHp === 'number' && typeof maxHp === 'number'
+        ? ` (${currentHp}/${maxHp})`
+        : '';
     const lostAmt = typeof deltaHp === 'number' ? Math.abs(deltaHp) : 0;
     const lostSuffix = lostAmt > 0 ? ` -${lostAmt} HP` : '';
 
     const src = annotations.sourceName?.toLowerCase();
-    if (src === 'confusion') return `${name} hurt itself in its confusion!${lostSuffix}${hpTag}`;
-    if (src === 'recoil') return `${name} was damaged by the recoil!${lostSuffix}${hpTag}`;
+    if (src === 'confusion')
+      return `${name} hurt itself in its confusion!${lostSuffix}${hpTag}`;
+    if (src === 'recoil')
+      return `${name} was damaged by the recoil!${lostSuffix}${hpTag}`;
     if (annotations.sourceType === 'status') {
-      return `${name} was hurt by its ${this.formatStatusName(annotations.sourceName || '')}!${lostSuffix}${hpTag}`;
+      return `${name} was hurt by its ${this.formatStatusName(
+        annotations.sourceName || ''
+      )}!${lostSuffix}${hpTag}`;
     }
     if (annotations.sourceType === 'item') {
       return `${name} was hurt by its ${annotations.sourceName}!${lostSuffix}${hpTag}`;
@@ -2469,12 +2736,13 @@ export class BattleSessionManager {
     deltaHp: number | undefined,
     currentHp: number | null | undefined,
     maxHp: number | null | undefined,
-    annotations: { sourceType?: string; sourceName?: string | null },
+    annotations: { sourceType?: string; sourceName?: string | null }
   ): string {
     const name = target || 'The Pokémon';
-    const hpTag = typeof currentHp === 'number' && typeof maxHp === 'number'
-      ? ` (${currentHp}/${maxHp})`
-      : '';
+    const hpTag =
+      typeof currentHp === 'number' && typeof maxHp === 'number'
+        ? ` (${currentHp}/${maxHp})`
+        : '';
     const healAmt = typeof deltaHp === 'number' ? Math.abs(deltaHp) : 0;
     const healSuffix = healAmt > 0 ? ` +${healAmt} HP` : '';
 
@@ -2557,7 +2825,11 @@ export class BattleSessionManager {
     if (fromRaw.toLowerCase() === 'recoil') {
       return { sourceType: 'other', sourceName: 'recoil' };
     }
-    if (/(sandstorm|hail|snow|raindance|sunnyday|desolateland|primordialsea)/i.test(fromRaw)) {
+    if (
+      /(sandstorm|hail|snow|raindance|sunnyday|desolateland|primordialsea)/i.test(
+        fromRaw
+      )
+    ) {
       return { sourceType: 'weather', sourceName: fromRaw };
     }
     if (/(psn|tox|brn|slp|frz|par|poison|burn)/i.test(fromRaw)) {
@@ -2573,15 +2845,34 @@ export class BattleSessionManager {
     status: string | null;
     fainted: boolean;
   } {
-    if (!hpState) return { hpPercent: null, currentHp: null, maxHp: null, status: null, fainted: false };
+    if (!hpState)
+      return {
+        hpPercent: null,
+        currentHp: null,
+        maxHp: null,
+        status: null,
+        fainted: false,
+      };
     if (hpState.includes('fnt')) {
-      return { hpPercent: 0, currentHp: 0, maxHp: null, status: null, fainted: true };
+      return {
+        hpPercent: 0,
+        currentHp: 0,
+        maxHp: null,
+        status: null,
+        fainted: true,
+      };
     }
 
     const fractionMatch = hpState.match(/(\d+)\/(\d+)/);
     const statusMatch = hpState.match(/\b(brn|psn|tox|par|slp|frz)\b/);
     if (!fractionMatch) {
-      return { hpPercent: null, currentHp: null, maxHp: null, status: statusMatch?.[1] ?? null, fainted: false };
+      return {
+        hpPercent: null,
+        currentHp: null,
+        maxHp: null,
+        status: statusMatch?.[1] ?? null,
+        fainted: false,
+      };
     }
 
     const current = Number(fractionMatch[1]);
@@ -2599,7 +2890,7 @@ export class BattleSessionManager {
   }
 }
 
-interface BattleSideLike {
+export interface BattleSideLike {
   active?: Array<{
     moveSlots?: Array<{ maxpp?: number }>;
     name?: string;
@@ -2608,12 +2899,15 @@ interface BattleSideLike {
     ability?: string;
     types?: string[];
     getTypes?: () => string[];
+    volatiles?: Record<string, unknown>;
+    species?: { baseStats?: { spe?: number } };
   }>;
   pokemon?: Array<{
     fullname?: string;
     name?: string;
-    species?: { name?: string };
+    species?: { name?: string; baseStats?: { spe?: number } };
     position?: number;
+    level?: number;
     hp?: number;
     maxhp?: number;
     status?: string;
@@ -2624,12 +2918,36 @@ interface BattleSideLike {
     baseAbility?: string;
     set?: { item?: string; ability?: string };
   }>;
+  sideConditions?: Record<string, { layers?: number; [key: string]: unknown }>;
 }
 
-interface BattleWithDex {
+export interface BattleFieldLike {
+  weather?: string;
+  weatherState?: { id?: string; duration?: number; source?: unknown };
+  terrain?: string;
+  terrainState?: { id?: string; duration?: number };
+  pseudoWeather?: Record<
+    string,
+    { id?: string; duration?: number; [key: string]: unknown }
+  >;
+}
+
+export interface BattleWithDex {
   sides?: BattleSideLike[];
+  field?: BattleFieldLike;
   dex?: {
-    moves?: { get?: (idOrName: string) => { type?: string; basePower?: number; accuracy?: number | true; category?: string } | undefined };
+    moves?: {
+      get?: (
+        idOrName: string
+      ) =>
+        | {
+            type?: string;
+            basePower?: number;
+            accuracy?: number | true;
+            category?: string;
+          }
+        | undefined;
+    };
     getImmunity?: (source: string, target: unknown) => boolean;
     getEffectiveness?: (source: string, target: unknown) => number;
   };

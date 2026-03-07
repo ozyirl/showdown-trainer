@@ -1,6 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { generateText } from 'ai';
-import { openai } from '@ai-sdk/openai';
+import type OpenAI from 'openai';
+import { ReplaySubject } from 'rxjs';
+import {
+  CPU_MOVE_SYSTEM_INSTRUCTIONS,
+  CPU_ACTION_SYSTEM_INSTRUCTIONS,
+} from './system-prompts';
+import {
+  resolveModelId,
+  getTokenBudget,
+  parseJsonFromModelOutput,
+} from './model-utils';
+import { getOpenAiClient } from './openai-client';
 
 export interface CpuMoveDecisionInput {
   battleId: string;
@@ -62,26 +72,46 @@ export interface CpuMoveDecisionResult {
   error?: string;
 }
 
+export type CpuStreamEvent =
+  | { type: 'start'; turn: number; modelId: string }
+  | { type: 'chunk'; turn: number; content: string }
+  | {
+      type: 'done';
+      turn: number;
+      choice: string;
+      actionType: 'move' | 'switch' | 'default';
+      source: 'model' | 'fallback';
+      modelId: string;
+      latencyMs: number;
+      rawResponse?: string;
+      reasoning?: string;
+      error?: string;
+    }
+  | {
+      type: 'model-error';
+      turn: number;
+      modelId: string;
+      error: string;
+      latencyMs: number;
+    };
+
 @Injectable()
 export class CpuMoveAiService {
   private readonly logger = new Logger(CpuMoveAiService.name);
-
-  getDefaultModel() {
-    const modelId = process.env.OPENAI_CPU_MODEL || 'gpt-4.1-mini';
-    if (!process.env.OPENAI_API_KEY) {
-      throw new Error('OPENAI_API_KEY is not set');
-    }
-    return openai(modelId);
-  }
+  private readonly battleStreams = new Map<string, ReplaySubject<CpuStreamEvent>>();
 
   getDefaultModelId(): string {
-    return process.env.OPENAI_CPU_MODEL || 'gpt-4.1-mini';
+    return resolveModelId('OPENAI_CPU_MODEL');
   }
 
-  /**
-   * Scaffold-only stub for future CPU move selection.
-   * For now this only demonstrates client/model initialization and prompt wiring.
-   */
+  getBattleStream(battleId: string): ReplaySubject<CpuStreamEvent> {
+    return this.ensureBattleStream(battleId);
+  }
+
+  clearBattleStream(battleId: string): void {
+    this.battleStreams.delete(battleId);
+  }
+
   async chooseCpuMove(
     input: CpuMoveDecisionInput
   ): Promise<CpuMoveDecisionResult> {
@@ -89,59 +119,82 @@ export class CpuMoveAiService {
       throw new Error('No available CPU moves to choose from');
     }
 
-    const prompt = this.buildMovePrompt(input);
-
     const modelId = this.getDefaultModelId();
     const startedAt = Date.now();
 
     try {
-      const result = await generateText({
-        model: this.getDefaultModel(),
-        prompt,
-        maxOutputTokens: 80,
+      const rawText = await this.streamCompletion({
+        battleId: input.battleId,
+        turn: input.turn,
+        modelId,
+        systemInstruction: CPU_MOVE_SYSTEM_INSTRUCTIONS[0],
+        prompt: this.buildMovePrompt(input),
+        maxCompletionTokens: getTokenBudget(modelId, 'move'),
       });
 
-      const latencyMs = Date.now() - startedAt;
-      const parsed = this.parseMoveDecision(result.text, input);
+      const parsed = this.parseMoveDecision(rawText, input);
       const originalMoveIndex = parsed.moveIndex;
-      let selectedMove = input.availableMoves.find(
-        (move) => move.index === parsed.moveIndex
-      );
       const immunityOverride = this.overrideImmuneChoiceIfNeeded(
         parsed.moveIndex,
         input
       );
-      if (immunityOverride !== null) {
-        parsed.moveIndex = immunityOverride;
-        selectedMove = input.availableMoves.find(
-          (move) => move.index === parsed.moveIndex
-        );
-      }
+      const moveIndex = immunityOverride ?? parsed.moveIndex;
+      const selectedMove = input.availableMoves.find(
+        (move) => move.index === moveIndex
+      );
       const originalMove = input.availableMoves.find(
         (move) => move.index === originalMoveIndex
       );
+      const latencyMs = Date.now() - startedAt;
+
       this.logger.debug(
-        `CPU move model response (${latencyMs}ms): ${result.text} | selected=${selectedMove?.name ?? parsed.moveIndex}${
+        `CPU move final (${latencyMs}ms): source=${parsed.source} selected=${
+          selectedMove?.name ?? moveIndex
+        }${
           immunityOverride !== null
-            ? ` | override=${originalMove?.name ?? originalMoveIndex}->${selectedMove?.name ?? immunityOverride} (immune)`
+            ? ` | override=${originalMove?.name ?? originalMoveIndex}->${
+                selectedMove?.name ?? moveIndex
+              } (immune)`
             : ''
         }`
       );
 
-      return {
-        ...parsed,
-        source: 'model',
+      this.emitDoneEvent(input.battleId, {
+        turn: input.turn,
+        choice: `move ${moveIndex}`,
+        actionType: 'move',
+        source: parsed.source,
         modelId,
         latencyMs,
-        rawResponse: result.text,
+        rawResponse: rawText,
+        reasoning: parsed.reasoning,
+      });
+
+      return {
+        moveIndex,
+        source: parsed.source,
+        modelId,
+        latencyMs,
+        rawResponse: rawText,
+        reasoning: parsed.reasoning,
       };
     } catch (error) {
       const latencyMs = Date.now() - startedAt;
       const message = error instanceof Error ? error.message : 'Unknown error';
+      this.emitErrorEvent(input.battleId, input.turn, modelId, message, latencyMs);
       if (this.isStrictAiMode()) {
         throw new Error(`CPU AI strict mode: ${message}`);
       }
       this.logger.warn(`CPU move fallback (${latencyMs}ms): ${message}`);
+      this.emitDoneEvent(input.battleId, {
+        turn: input.turn,
+        choice: `move ${input.availableMoves[0].index}`,
+        actionType: 'move',
+        source: 'fallback',
+        modelId,
+        latencyMs,
+        error: message,
+      });
       return {
         moveIndex: input.availableMoves[0].index,
         source: 'fallback',
@@ -181,33 +234,56 @@ export class CpuMoveAiService {
     );
 
     try {
-      const result = await generateText({
-        model: this.getDefaultModel(),
+      const rawText = await this.streamCompletion({
+        battleId: input.battleId,
+        turn: input.turn,
+        modelId,
+        systemInstruction: CPU_ACTION_SYSTEM_INSTRUCTIONS[0],
         prompt: this.buildActionPrompt(input, legalSwitches),
-        maxOutputTokens: 120,
+        maxCompletionTokens: getTokenBudget(modelId, 'action'),
       });
 
-      const latencyMs = Date.now() - startedAt;
       const parsed = this.parseActionDecision(
-        result.text,
+        rawText,
         input.availableMoves,
         legalSwitches,
         forceSwitch
       );
+      const latencyMs = Date.now() - startedAt;
+
+      this.emitDoneEvent(input.battleId, {
+        turn: input.turn,
+        choice: parsed.choice,
+        actionType: parsed.actionType,
+        source: parsed.source,
+        modelId,
+        latencyMs,
+        rawResponse: rawText,
+        reasoning: parsed.reasoning,
+      });
 
       return {
         ...parsed,
-        source: 'model',
         modelId,
         latencyMs,
-        rawResponse: result.text,
+        rawResponse: rawText,
       };
     } catch (error) {
       const latencyMs = Date.now() - startedAt;
       const message = error instanceof Error ? error.message : 'Unknown error';
+      this.emitErrorEvent(input.battleId, input.turn, modelId, message, latencyMs);
       if (this.isStrictAiMode()) {
         throw new Error(`CPU AI strict mode: ${message}`);
       }
+      this.emitDoneEvent(input.battleId, {
+        turn: input.turn,
+        choice: fallbackChoice.choice,
+        actionType: fallbackChoice.actionType,
+        source: 'fallback',
+        modelId,
+        latencyMs,
+        error: message,
+      });
       return {
         choice: fallbackChoice.choice,
         actionType: fallbackChoice.actionType,
@@ -217,6 +293,88 @@ export class CpuMoveAiService {
         error: message,
       };
     }
+  }
+
+  private async streamCompletion(params: {
+    battleId: string;
+    turn: number;
+    modelId: string;
+    systemInstruction: string;
+    prompt: string;
+    maxCompletionTokens: number;
+  }): Promise<string> {
+    const stream = this.ensureBattleStream(params.battleId);
+    stream.next({
+      type: 'start',
+      turn: params.turn,
+      modelId: params.modelId,
+    });
+
+    const client = getOpenAiClient();
+    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      { role: 'system', content: params.systemInstruction },
+      { role: 'user', content: params.prompt },
+    ];
+
+    const completion = await client.chat.completions.create({
+      model: params.modelId,
+      messages,
+      stream: true,
+      max_completion_tokens: params.maxCompletionTokens,
+      reasoning_effort: 'minimal',
+    });
+
+    let fullText = '';
+    for await (const chunk of completion) {
+      const content = chunk.choices[0]?.delta?.content;
+      if (typeof content !== 'string' || content.length === 0) {
+        continue;
+      }
+      fullText += content;
+      stream.next({
+        type: 'chunk',
+        turn: params.turn,
+        content,
+      });
+    }
+
+    this.logger.debug(
+      `CPU stream raw (${params.modelId}, turn ${params.turn}): ${fullText.length} chars`
+    );
+
+    return fullText;
+  }
+
+  private emitDoneEvent(
+    battleId: string,
+    event: Extract<CpuStreamEvent, { type: 'done' }>
+  ): void {
+    this.ensureBattleStream(battleId).next({ type: 'done', ...event });
+  }
+
+  private emitErrorEvent(
+    battleId: string,
+    turn: number,
+    modelId: string,
+    error: string,
+    latencyMs: number
+  ): void {
+    this.ensureBattleStream(battleId).next({
+      type: 'model-error',
+      turn,
+      modelId,
+      error,
+      latencyMs,
+    });
+  }
+
+  private ensureBattleStream(battleId: string): ReplaySubject<CpuStreamEvent> {
+    let stream = this.battleStreams.get(battleId);
+    if (!stream) {
+      stream = new ReplaySubject<CpuStreamEvent>(1024);
+      this.battleStreams.set(battleId, stream);
+    }
+    return stream;
   }
 
   private buildMovePrompt(input: CpuMoveDecisionInput): string {
@@ -238,7 +396,6 @@ export class CpuMoveAiService {
     const recentLog = (input.recentLog ?? []).slice(-4).join('\n');
 
     return [
-      'You are choosing a Pokemon battle move for the CPU in a Pokemon Showdown-style battle.',
       `Turn: ${input.turn}`,
       `CPU Pokemon: ${input.cpuPokemonName}`,
       input.cpuPokemonTypes?.length
@@ -250,10 +407,10 @@ export class CpuMoveAiService {
         : '',
       'Available moves:',
       moves,
-      recentLog ? 'Recent battle log (brief):\n' + recentLog : '',
-      'Do not choose moves that have 0x effectiveness / immunity unless no other legal move is available.',
-      'Return JSON only: {"moveIndex": <number>, "moveName": "<name>", "reasoning": "<short reason>"}',
-      'Keep reasoning very short (max 12 words).',
+      recentLog ? `Recent battle log (brief):\n${recentLog}` : '',
+      CPU_MOVE_SYSTEM_INSTRUCTIONS[1],
+      CPU_MOVE_SYSTEM_INSTRUCTIONS[2],
+      CPU_MOVE_SYSTEM_INSTRUCTIONS[3],
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -281,15 +438,14 @@ export class CpuMoveAiService {
     const switchLines = legalSwitches
       .map(
         (switchOption) =>
-          `switch ${switchOption.slot} - ${switchOption.name} (${switchOption.hpPercent}% HP${
-            switchOption.status ? `, ${switchOption.status}` : ''
-          })`
+          `switch ${switchOption.slot} - ${switchOption.name} (${
+            switchOption.hpPercent
+          }% HP${switchOption.status ? `, ${switchOption.status}` : ''})`
       )
       .join('\n');
 
     const recentLog = (input.recentLog ?? []).slice(-4).join('\n');
     return [
-      'You are choosing the CPU action in a Pokemon Showdown battle.',
       `Turn: ${input.turn}`,
       `CPU active: ${input.cpuPokemonName}`,
       `Opponent active: ${input.playerPokemonName}`,
@@ -307,9 +463,9 @@ export class CpuMoveAiService {
         ? `Legal switches:\n${switchLines}`
         : 'No legal switches this turn.',
       recentLog ? `Recent log:\n${recentLog}` : '',
-      'Never choose immune moves when non-immune options exist.',
-      'Return JSON only: {"choice":"move 1"|"switch 3"|"default","reasoning":"short reason"}',
-      'Keep reasoning very short (max 12 words).',
+      CPU_ACTION_SYSTEM_INSTRUCTIONS[1],
+      CPU_ACTION_SYSTEM_INSTRUCTIONS[2],
+      CPU_ACTION_SYSTEM_INSTRUCTIONS[3],
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -319,11 +475,9 @@ export class CpuMoveAiService {
     text: string,
     input: CpuMoveDecisionInput
   ): CpuMoveDecisionResult {
-    const validIndices = new Set(
-      input.availableMoves.map((move) => move.index)
-    );
+    const validIndices = new Set(input.availableMoves.map((move) => move.index));
 
-    const parsedJson = this.tryParseJsonObject(text);
+    const parsedJson = parseJsonFromModelOutput(text);
     if (parsedJson) {
       const moveIndexFromJson = this.normalizeAiMoveIndex(
         this.coerceMoveIndex(parsedJson.moveIndex),
@@ -353,9 +507,7 @@ export class CpuMoveAiService {
       }
     }
 
-    const explicitIndexMatch = text.match(
-      /(?:moveIndex|index)\s*["':= ]+\s*(\d+)/i
-    );
+    const explicitIndexMatch = text.match(/(?:moveIndex|index)\s*["':= ]+\s*(\d+)/i);
     if (explicitIndexMatch) {
       const moveIndex = this.normalizeAiMoveIndex(
         Number(explicitIndexMatch[1]),
@@ -394,35 +546,6 @@ export class CpuMoveAiService {
     };
   }
 
-  private isStrictAiMode(): boolean {
-    return process.env.OPENAI_CPU_STRICT === 'true';
-  }
-
-  private overrideImmuneChoiceIfNeeded(
-    moveIndex: number,
-    input: CpuMoveDecisionInput
-  ): number | null {
-    const selected = input.availableMoves.find((move) => move.index === moveIndex);
-    if (!selected?.isImmune) return null;
-
-    const alternatives = input.availableMoves.filter(
-      (move) => !move.isImmune
-    );
-    if (alternatives.length === 0) return null;
-
-    alternatives.sort((a, b) => {
-      const multA = a.effectivenessMultiplier ?? 1;
-      const multB = b.effectivenessMultiplier ?? 1;
-      if (multB !== multA) return multB - multA;
-      const powerA = a.power ?? 0;
-      const powerB = b.power ?? 0;
-      if (powerB !== powerA) return powerB - powerA;
-      return a.index - b.index;
-    });
-
-    return alternatives[0].index;
-  }
-
   private parseActionDecision(
     text: string,
     availableMoves: CpuMoveDecisionInput['availableMoves'],
@@ -440,7 +563,7 @@ export class CpuMoveAiService {
       'default',
     ]);
 
-    const parsedJson = this.tryParseJsonObject(text);
+    const parsedJson = parseJsonFromModelOutput(text);
     const jsonChoice =
       typeof parsedJson?.choice === 'string' ? parsedJson.choice.trim() : '';
     if (jsonChoice) {
@@ -585,25 +708,31 @@ export class CpuMoveAiService {
     return { choice: `move ${bestMove.index}`, actionType: 'move' };
   }
 
-  private tryParseJsonObject(text: string): Record<string, unknown> | null {
-    const trimmed = text.trim();
-    const direct = this.safeJsonParse(trimmed);
-    if (direct) return direct;
-
-    const objectMatch = trimmed.match(/\{[\s\S]*\}/);
-    if (!objectMatch) return null;
-    return this.safeJsonParse(objectMatch[0]);
+  private isStrictAiMode(): boolean {
+    return process.env.OPENAI_CPU_STRICT === 'true';
   }
 
-  private safeJsonParse(text: string): Record<string, unknown> | null {
-    try {
-      const value = JSON.parse(text) as unknown;
-      if (!value || typeof value !== 'object' || Array.isArray(value))
-        return null;
-      return value as Record<string, unknown>;
-    } catch {
-      return null;
-    }
+  private overrideImmuneChoiceIfNeeded(
+    moveIndex: number,
+    input: CpuMoveDecisionInput
+  ): number | null {
+    const selected = input.availableMoves.find((move) => move.index === moveIndex);
+    if (!selected?.isImmune) return null;
+
+    const alternatives = input.availableMoves.filter((move) => !move.isImmune);
+    if (alternatives.length === 0) return null;
+
+    alternatives.sort((a, b) => {
+      const multA = a.effectivenessMultiplier ?? 1;
+      const multB = b.effectivenessMultiplier ?? 1;
+      if (multB !== multA) return multB - multA;
+      const powerA = a.power ?? 0;
+      const powerB = b.power ?? 0;
+      if (powerB !== powerA) return powerB - powerA;
+      return a.index - b.index;
+    });
+
+    return alternatives[0].index;
   }
 
   private coerceMoveIndex(value: unknown): number | null {
@@ -621,7 +750,6 @@ export class CpuMoveAiService {
     const oneBasedValid = input.availableMoves.some((move) => move.index === rawIndex);
     if (oneBasedValid) return rawIndex;
 
-    // Accept 0-based indices from the model and convert to the backend's 1-based move slots.
     const oneBasedFromZero = rawIndex + 1;
     const zeroBasedValid = input.availableMoves.some(
       (move) => move.index === oneBasedFromZero
@@ -659,7 +787,9 @@ export class CpuMoveAiService {
           (move) => move.index === moveIndexFromName
         );
         this.logger.warn(
-          `CPU AI returned conflicting moveIndex/moveName: index=${moveIndexFromJson} (${jsonMove?.name ?? 'unknown'}), moveName=${nameMove?.name ?? 'unknown'}; preferring moveName`
+          `CPU AI returned conflicting moveIndex/moveName: index=${moveIndexFromJson} (${
+            jsonMove?.name ?? 'unknown'
+          }), moveName=${nameMove?.name ?? 'unknown'}; preferring moveName`
         );
       }
       return moveIndexFromName;

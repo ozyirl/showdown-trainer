@@ -58,8 +58,11 @@
     "@supabase/supabase-js": "^2.98.0",
     "ai": "^6.0.97",
     "axios": "^1.6.0",
+    "jsonrepair": "^3.13.2",
+    "openai": "^6.27.0",
     "pokemon-showdown": "^0.11.10",
     "reflect-metadata": "^0.1.13",
-    "rxjs": "^7.8.0"
+    "rxjs": "^7.8.0",
+    "zod": "^4.3.6"
   }
 }

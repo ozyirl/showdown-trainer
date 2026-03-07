@@ -7,6 +7,7 @@ import { BattleSessionManager } from './battle-session.manager';
 import { OrgCommonModule } from '@org/common';
 import { BattleEngineModule } from '@org/battle-engine';
 import { CpuMoveAiService } from './cpu-move-ai.service';
+import { CopilotService } from './copilot.service';
 import { TeamsModule } from './teams/teams.module';
 
 @Module({
@@ -17,6 +18,7 @@ import { TeamsModule } from './teams/teams.module';
     BattleService,
     BattleSessionManager,
     CpuMoveAiService,
+    CopilotService,
   ],
 })
 export class AppModule {}

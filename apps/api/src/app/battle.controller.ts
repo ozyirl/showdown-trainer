@@ -1,13 +1,25 @@
-import { Controller, Get, Post, Param, Body, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  MessageEvent,
+  Param,
+  Post,
+  Query,
+  Sse,
+} from '@nestjs/common';
 import { BattleService } from './battle.service';
 import type { StartBattleRequest } from './battle.service';
 import { BattleSessionManager } from './battle-session.manager';
+import { CopilotService } from './copilot.service';
+import { Observable, map } from 'rxjs';
 
 @Controller('battle')
 export class BattleController {
   constructor(
     private readonly battleService: BattleService,
-    private readonly battleSessionManager: BattleSessionManager
+    private readonly battleSessionManager: BattleSessionManager,
+    private readonly copilotService: CopilotService,
   ) {}
 
   @Get('simulate')
@@ -110,8 +122,23 @@ export class BattleController {
     );
   }
 
+  @Get(':id/copilot')
+  async getCopilotGuidance(@Param('id') battleId: string) {
+    return this.copilotService.getCopilotGuidance(battleId);
+  }
+
   @Get(':id/state')
   async getBattleState(@Param('id') battleId: string) {
     return this.battleSessionManager.getBattleState(battleId);
+  }
+
+  @Sse(':id/cpu-stream')
+  cpuStream(@Param('id') battleId: string): Observable<MessageEvent> {
+    return this.battleSessionManager.getCpuStream(battleId).pipe(
+      map((event) => ({
+        type: event.type,
+        data: event,
+      }))
+    );
   }
 }
