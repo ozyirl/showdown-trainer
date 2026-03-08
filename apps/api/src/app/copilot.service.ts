@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { generateText, generateObject } from 'ai';
 import { z } from 'zod';
 import {
+  resolveCopilotModelId,
   resolveModelId,
   createModel,
   getTokenBudget,
@@ -51,6 +52,11 @@ export const CopilotGuidanceSchema = z.object({
   winConditionNote: z
     .string()
     .describe('One sentence about the current win condition path'),
+  disabled: z.literal(true).optional(),
+});
+
+const CopilotGuidanceExtractorSchema = CopilotGuidanceSchema.omit({
+  disabled: true,
 });
 
 export type CopilotGuidance = z.infer<typeof CopilotGuidanceSchema>;
@@ -141,18 +147,30 @@ export class CopilotService {
       session,
       battleService
     );
-    const modelId = resolveModelId(
-      'OPENAI_COPILOT_MODEL',
-      resolveModelId('OPENAI_CPU_MODEL'),
-    );
+    const modelId = resolveCopilotModelId(session.copilotMode);
 
     const prompt = this.buildUserPrompt(snapshot);
     const cacheKey = `${battleId}::${snapshot.turn}::${session.phase}`;
-    return { snapshot, modelId, prompt, cacheKey };
+    return { snapshot, modelId, prompt, cacheKey, copilotEnabled: session.copilotEnabled };
   }
 
   async getCopilotGuidance(battleId: string): Promise<CopilotGuidance> {
-    const { snapshot, modelId, prompt, cacheKey } = this.prepareCopilotCall(battleId);
+    const { snapshot, modelId, prompt, cacheKey, copilotEnabled } =
+      this.prepareCopilotCall(battleId);
+
+    if (!copilotEnabled) {
+      return {
+        disabled: true,
+        recommendedAction: '',
+        recommendedLabel: '',
+        confidence: 'low',
+        reasoning: '',
+        safeAlternative: null,
+        aggressiveAlternative: null,
+        mainRisk: '',
+        winConditionNote: '',
+      };
+    }
 
     const cached = this.guidanceCache.get(cacheKey);
     if (cached) {
@@ -232,7 +250,7 @@ export class CopilotService {
     try {
       const { object } = await generateObject({
         model: createModel(extractorModelId),
-        schema: CopilotGuidanceSchema,
+        schema: CopilotGuidanceExtractorSchema,
         prompt: [
           'Extract structured battle guidance from the following AI analysis.',
           'The legal actions available are:',

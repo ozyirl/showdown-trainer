@@ -30,9 +30,15 @@ export interface PokemonMoveItem {
   target: string;
 }
 
+export type CopilotMode = 'off' | 'coach' | 'deep';
+export type CpuModelProfile = 'fast' | 'reasoning';
+
 export interface StartBattleRequest {
   p1Team?: StartBattleTeamInput[];
   p2Team?: StartBattleTeamInput[];
+  copilotEnabled?: boolean;
+  copilotMode?: CopilotMode;
+  cpuModelProfile?: CpuModelProfile;
   p1TeamPreviewChoice?: string;
   p2TeamPreviewChoice?: string;
   randomTeams?: boolean;
@@ -53,6 +59,53 @@ export interface StartBattleTeamMemberInput {
 }
 
 export type StartBattleTeamInput = string | StartBattleTeamMemberInput;
+
+export function normalizeCopilotMode(
+  value?: string | null
+): CopilotMode | undefined {
+  switch ((value ?? '').trim().toLowerCase()) {
+    case 'off':
+    case 'coach':
+    case 'deep':
+      return value!.trim().toLowerCase() as CopilotMode;
+    default:
+      return undefined;
+  }
+}
+
+export function normalizeCpuModelProfile(
+  value?: string | null
+): CpuModelProfile | undefined {
+  switch ((value ?? '').trim().toLowerCase()) {
+    case 'fast':
+    case 'reasoning':
+      return value!.trim().toLowerCase() as CpuModelProfile;
+    default:
+      return undefined;
+  }
+}
+
+export function resolveRandomTeamFormatId(value?: string | null): string {
+  const normalized = value?.trim().toLowerCase();
+  return normalized || 'gen9randombattle';
+}
+
+export function resolveBattleFormatId(config?: {
+  formatid?: string;
+  randomTeams?: boolean;
+  randomTeamFormatid?: string;
+}): string {
+  const formatid = config?.formatid?.trim().toLowerCase();
+  if (formatid) {
+    return formatid;
+  }
+
+  if (config?.randomTeams && config.randomTeamFormatid?.trim()) {
+    return resolveRandomTeamFormatId(config.randomTeamFormatid);
+  }
+
+  return 'gen9customgame';
+}
 
 export interface ShowdownRequestMoveOption {
   move: string;

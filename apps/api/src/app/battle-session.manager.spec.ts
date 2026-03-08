@@ -70,6 +70,55 @@ describe('BattleSessionManager 6v6 flow', () => {
     ]);
   });
 
+  it('supports the frontend random battle quick-start defaults', async () => {
+    const state = await manager.createBattle({
+      randomTeams: true,
+      formatid: 'gen9randombattle',
+      randomTeamFormatid: 'gen9randombattle',
+    });
+
+    expect(state.sides.p1.team).toHaveLength(6);
+    expect(state.sides.p2.team).toHaveLength(6);
+    expect(state.sides.p1.active?.name).toBeTruthy();
+    expect(state.sides.p2.active?.name).toBeTruthy();
+  });
+
+  it('stores ai config when provided and preserves old defaults when omitted', async () => {
+    const configuredState = await manager.createBattle({
+      randomTeams: true,
+      randomTeamFormatid: 'gen9randombattle',
+      copilotMode: 'deep',
+      cpuModelProfile: 'reasoning',
+    });
+    const configuredSession = (
+      manager as unknown as { sessions: Map<string, unknown> }
+    ).sessions.get(configuredState.battleId) as {
+      copilotEnabled: boolean;
+      copilotMode?: string;
+      cpuModelProfile?: string;
+    };
+
+    expect(configuredSession.copilotEnabled).toBe(true);
+    expect(configuredSession.copilotMode).toBe('deep');
+    expect(configuredSession.cpuModelProfile).toBe('reasoning');
+
+    const defaultState = await manager.createBattle({
+      randomTeams: true,
+      randomTeamFormatid: 'gen9randombattle',
+    });
+    const defaultSession = (
+      manager as unknown as { sessions: Map<string, unknown> }
+    ).sessions.get(defaultState.battleId) as {
+      copilotEnabled: boolean;
+      copilotMode?: string;
+      cpuModelProfile?: string;
+    };
+
+    expect(defaultSession.copilotEnabled).toBe(true);
+    expect(defaultSession.copilotMode).toBeUndefined();
+    expect(defaultSession.cpuModelProfile).toBeUndefined();
+  });
+
   it('exposes legal switches when bench pokemon are available', async () => {
     const state = await manager.createBattle();
 

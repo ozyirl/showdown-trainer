@@ -1,5 +1,6 @@
 import { openai } from '@ai-sdk/openai';
 import { jsonrepair } from 'jsonrepair';
+import type { CopilotMode, CpuModelProfile } from './battle.service';
 
 // Known reasoning model families / prefixes.
 // Extend this list as new reasoning models ship.
@@ -39,6 +40,50 @@ export function resolveModelId(
   fallback = 'gpt-4.1-mini',
 ): string {
   return process.env[envVar] || fallback;
+}
+
+export function resolveCpuModelId(profile?: CpuModelProfile): string {
+  if (profile === 'fast') {
+    return resolveModelId('OPENAI_CPU_FAST_MODEL', 'gpt-4.1-nano-2025-04-14');
+  }
+
+  if (profile === 'reasoning') {
+    return resolveModelId(
+      'OPENAI_CPU_REASONING_MODEL',
+      resolveModelId('OPENAI_CPU_MODEL', 'gpt-5-nano-2025-08-07')
+    );
+  }
+
+  return resolveModelId('OPENAI_CPU_MODEL');
+}
+
+export function resolveCopilotModelId(mode?: CopilotMode): string {
+  const effectiveMode = mode === 'off' ? undefined : mode ?? 'coach';
+
+  if (effectiveMode === 'deep') {
+    return resolveModelId(
+      'OPENAI_COPILOT_DEEP_MODEL',
+      resolveModelId(
+        'OPENAI_COPILOT_MODEL',
+        resolveCpuModelId('reasoning')
+      )
+    );
+  }
+
+  if (effectiveMode === 'coach') {
+    return resolveModelId(
+      'OPENAI_COPILOT_COACH_MODEL',
+      resolveModelId(
+        'OPENAI_COPILOT_MODEL',
+        resolveCpuModelId('fast')
+      )
+    );
+  }
+
+  return resolveModelId(
+    'OPENAI_COPILOT_MODEL',
+    resolveModelId('OPENAI_CPU_MODEL')
+  );
 }
 
 export function createModel(modelId: string) {

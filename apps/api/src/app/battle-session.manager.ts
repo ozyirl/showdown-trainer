@@ -9,6 +9,12 @@ import { Observable } from 'rxjs';
 import {
   BattleService,
   StartBattleRequest,
+  normalizeCopilotMode,
+  normalizeCpuModelProfile,
+  resolveBattleFormatId,
+  resolveRandomTeamFormatId,
+  type CopilotMode,
+  type CpuModelProfile,
   type ShowdownLegalOptions,
   type ShowdownRequest,
 } from './battle.service';
@@ -240,6 +246,9 @@ export interface BattlePlaybackEvent {
 class BattleSession {
   id: string;
   battle: Battle;
+  copilotEnabled = true;
+  copilotMode?: CopilotMode;
+  cpuModelProfile?: CpuModelProfile;
   p1Choice: string | null = null;
   p2Choice: string | null = null;
   turnLog: string[] = [];
@@ -301,6 +310,8 @@ export class BattleSessionManager {
       turnLog: string[];
       lastTurnEvents: BattleTurnEvent[];
       phase: string;
+      copilotEnabled: boolean;
+      copilotMode?: CopilotMode;
     };
     battleService: BattleService;
   } {
@@ -315,6 +326,8 @@ export class BattleSessionManager {
         turnLog: session.turnLog,
         lastTurnEvents: session.lastTurnEvents,
         phase: session.phase,
+        copilotEnabled: session.copilotEnabled,
+        copilotMode: session.copilotMode,
       },
       battleService: this.battleService,
     };
@@ -330,6 +343,16 @@ export class BattleSessionManager {
 
   async createBattle(config?: StartBattleRequest): Promise<BattleState> {
     const { Battle } = await import('pokemon-showdown');
+    const randomTeamFormatid = resolveRandomTeamFormatId(
+      config?.randomTeamFormatid
+    );
+    const formatid = resolveBattleFormatId({
+      formatid: config?.formatid,
+      randomTeams: config?.randomTeams,
+      randomTeamFormatid: config?.randomTeamFormatid,
+    });
+    const copilotMode = normalizeCopilotMode(config?.copilotMode);
+    const cpuModelProfile = normalizeCpuModelProfile(config?.cpuModelProfile);
 
     const p1Built = await this.battleService.buildTeam({
       team: config?.p1Team,
@@ -338,7 +361,7 @@ export class BattleSessionManager {
       fallbackLevel: config?.level,
       size: 6,
       randomTeams: config?.randomTeams,
-      randomTeamFormatid: config?.randomTeamFormatid,
+      randomTeamFormatid,
       randomSeed: this.seedForSide(config?.randomSeed, 0),
     });
     const p2Built = await this.battleService.buildTeam({
@@ -348,12 +371,12 @@ export class BattleSessionManager {
       fallbackLevel: config?.level,
       size: 6,
       randomTeams: config?.randomTeams,
-      randomTeamFormatid: config?.randomTeamFormatid,
+      randomTeamFormatid,
       randomSeed: this.seedForSide(config?.randomSeed, 1),
     });
 
     const battle = new Battle({
-      formatid: config?.formatid ?? 'gen9customgame',
+      formatid,
     });
 
     battle.setPlayer('p1', {
@@ -385,6 +408,9 @@ export class BattleSessionManager {
       .toString(36)
       .slice(2, 11)}`;
     const session = new BattleSession(battleId, battle);
+    session.copilotEnabled = config?.copilotEnabled ?? copilotMode !== 'off';
+    session.copilotMode = copilotMode;
+    session.cpuModelProfile = cpuModelProfile;
 
     session.lastLogIndex = battle.log.length;
     session.currentTurn = (battle as unknown as { turn?: number }).turn ?? 0;
@@ -1332,7 +1358,7 @@ export class BattleSessionManager {
         choice: teamChoice,
         actionType: 'team',
         source: 'fallback',
-        modelId: this.cpuMoveAiService.getDefaultModelId(),
+        modelId: this.cpuMoveAiService.getDefaultModelId(session.cpuModelProfile),
         latencyMs: 0,
         reasoning: 'Deterministic team preview order',
         turn: session.currentTurn,
@@ -1361,7 +1387,7 @@ export class BattleSessionManager {
         choice: fallback.choice,
         actionType: fallback.actionType,
         source: 'fallback',
-        modelId: this.cpuMoveAiService.getDefaultModelId(),
+        modelId: this.cpuMoveAiService.getDefaultModelId(session.cpuModelProfile),
         latencyMs: 0,
         reasoning: 'Deterministic fallback action',
         turn: session.currentTurn + 1,
@@ -1373,6 +1399,7 @@ export class BattleSessionManager {
       const decision = await this.cpuMoveAiService.chooseCpuAction({
         battleId: session.id,
         turn: session.currentTurn + 1,
+        modelProfile: session.cpuModelProfile,
         cpuPokemonName: p2Active?.name || 'Unknown',
         playerPokemonName: p1Active?.name || 'Unknown',
         forceSwitch: !!p2Legal.forceSwitch,
@@ -1413,7 +1440,7 @@ export class BattleSessionManager {
         choice: fallback.choice,
         actionType: fallback.actionType,
         source: 'fallback',
-        modelId: process.env.OPENAI_CPU_MODEL || 'gpt-5-nano-2025-08-07',
+        modelId: this.cpuMoveAiService.getDefaultModelId(session.cpuModelProfile),
         latencyMs: 0,
         reasoning: 'Fallback action after agent error',
         error: message,

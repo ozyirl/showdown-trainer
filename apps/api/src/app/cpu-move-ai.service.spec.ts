@@ -6,7 +6,20 @@ describe('CpuMoveAiService chooseCpuAction fallback', () => {
   beforeEach(() => {
     process.env.OPENAI_CPU_STRICT = 'false';
     delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_CPU_FAST_MODEL;
+    delete process.env.OPENAI_CPU_REASONING_MODEL;
+    delete process.env.OPENAI_CPU_MODEL;
     service = new CpuMoveAiService();
+  });
+
+  it('resolves cpu model profiles through the routing abstraction', () => {
+    process.env.OPENAI_CPU_MODEL = 'base-model';
+    process.env.OPENAI_CPU_FAST_MODEL = 'fast-model';
+    process.env.OPENAI_CPU_REASONING_MODEL = 'reasoning-model';
+
+    expect(service.getDefaultModelId()).toBe('base-model');
+    expect(service.getDefaultModelId('fast')).toBe('fast-model');
+    expect(service.getDefaultModelId('reasoning')).toBe('reasoning-model');
   });
 
   it('picks a legal switch on forced-switch turns', async () => {
