@@ -3,11 +3,14 @@ import type OpenAI from 'openai';
 import { ReplaySubject } from 'rxjs';
 import {
   CPU_MOVE_SYSTEM_INSTRUCTIONS,
+  CPU_MOVE_REASONING_SYSTEM_INSTRUCTIONS,
   CPU_ACTION_SYSTEM_INSTRUCTIONS,
+  CPU_ACTION_REASONING_SYSTEM_INSTRUCTIONS,
 } from './system-prompts';
 import {
   resolveCpuModelId,
   getTokenBudget,
+  isReasoningModel,
   parseJsonFromModelOutput,
 } from './model-utils';
 import { getOpenAiClient } from './openai-client';
@@ -63,6 +66,7 @@ export interface CpuActionDecisionResult {
   rawResponse?: string;
   reasoning?: string;
   error?: string;
+  truncated?: boolean;
 }
 
 export interface CpuMoveDecisionResult {
@@ -89,6 +93,7 @@ export type CpuStreamEvent =
       rawResponse?: string;
       reasoning?: string;
       error?: string;
+      truncated?: boolean;
     }
   | {
       type: 'model-error';
@@ -129,12 +134,15 @@ export class CpuMoveAiService {
     const startedAt = Date.now();
 
     try {
-      const rawText = await this.streamCompletion({
+      const reasoning = isReasoningModel(modelId);
+      const { text: rawText, truncated } = await this.streamCompletion({
         battleId: input.battleId,
         turn: input.turn,
         modelId,
-        systemInstruction: CPU_MOVE_SYSTEM_INSTRUCTIONS[0],
-        prompt: this.buildMovePrompt(input),
+        systemInstruction: reasoning
+          ? CPU_MOVE_REASONING_SYSTEM_INSTRUCTIONS[0]
+          : CPU_MOVE_SYSTEM_INSTRUCTIONS[0],
+        prompt: this.buildMovePrompt(input, reasoning),
         maxCompletionTokens: getTokenBudget(modelId, 'move'),
       });
 
@@ -174,6 +182,7 @@ export class CpuMoveAiService {
         latencyMs,
         rawResponse: rawText,
         reasoning: parsed.reasoning,
+        truncated,
       });
 
       return {
@@ -246,12 +255,15 @@ export class CpuMoveAiService {
     );
 
     try {
-      const rawText = await this.streamCompletion({
+      const reasoning = isReasoningModel(modelId);
+      const { text: rawText, truncated } = await this.streamCompletion({
         battleId: input.battleId,
         turn: input.turn,
         modelId,
-        systemInstruction: CPU_ACTION_SYSTEM_INSTRUCTIONS[0],
-        prompt: this.buildActionPrompt(input, legalSwitches),
+        systemInstruction: reasoning
+          ? CPU_ACTION_REASONING_SYSTEM_INSTRUCTIONS[0]
+          : CPU_ACTION_SYSTEM_INSTRUCTIONS[0],
+        prompt: this.buildActionPrompt(input, legalSwitches, reasoning),
         maxCompletionTokens: getTokenBudget(modelId, 'action'),
       });
 
@@ -272,6 +284,7 @@ export class CpuMoveAiService {
         latencyMs,
         rawResponse: rawText,
         reasoning: parsed.reasoning,
+        truncated,
       });
 
       return {
@@ -279,6 +292,7 @@ export class CpuMoveAiService {
         modelId,
         latencyMs,
         rawResponse: rawText,
+        truncated,
       };
     } catch (error) {
       const latencyMs = Date.now() - startedAt;
@@ -320,7 +334,7 @@ export class CpuMoveAiService {
     systemInstruction: string;
     prompt: string;
     maxCompletionTokens: number;
-  }): Promise<string> {
+  }): Promise<{ text: string; truncated: boolean }> {
     const stream = this.ensureBattleStream(params.battleId);
     stream.next({
       type: 'start',
@@ -339,12 +353,17 @@ export class CpuMoveAiService {
       messages,
       stream: true,
       max_completion_tokens: params.maxCompletionTokens,
-      reasoning_effort: 'medium',
+      ...(isReasoningModel(params.modelId) && { reasoning_effort: 'medium' }),
     });
 
     let fullText = '';
+    let finishReason: string | null = null;
     for await (const chunk of completion) {
-      const content = chunk.choices[0]?.delta?.content;
+      const choice = chunk.choices[0];
+      if (choice?.finish_reason) {
+        finishReason = choice.finish_reason;
+      }
+      const content = choice?.delta?.content;
       if (typeof content !== 'string' || content.length === 0) {
         continue;
       }
@@ -356,11 +375,19 @@ export class CpuMoveAiService {
       });
     }
 
+    const truncated = finishReason === 'length';
+    if (truncated) {
+      this.logger.warn(
+        `CPU stream truncated (${params.modelId}, turn ${params.turn}): ` +
+        `output was cut at ${fullText.length} chars (max_completion_tokens=${params.maxCompletionTokens})`
+      );
+    }
+
     this.logger.debug(
-      `CPU stream raw (${params.modelId}, turn ${params.turn}): ${fullText.length} chars`
+      `CPU stream raw (${params.modelId}, turn ${params.turn}): ${fullText.length} chars, finish=${finishReason}`
     );
 
-    return fullText;
+    return { text: fullText, truncated };
   }
 
   private emitDoneEvent(
@@ -395,7 +422,7 @@ export class CpuMoveAiService {
     return stream;
   }
 
-  private buildMovePrompt(input: CpuMoveDecisionInput): string {
+  private buildMovePrompt(input: CpuMoveDecisionInput, reasoning = false): string {
     const moves = input.availableMoves
       .map(
         (move) =>
@@ -413,6 +440,10 @@ export class CpuMoveAiService {
 
     const recentLog = (input.recentLog ?? []).slice(-4).join('\n');
 
+    const trailingInstructions = reasoning
+      ? [CPU_MOVE_REASONING_SYSTEM_INSTRUCTIONS[1]]
+      : [CPU_MOVE_SYSTEM_INSTRUCTIONS[1], CPU_MOVE_SYSTEM_INSTRUCTIONS[2], CPU_MOVE_SYSTEM_INSTRUCTIONS[3]];
+
     return [
       `Turn: ${input.turn}`,
       `CPU Pokemon: ${input.cpuPokemonName}`,
@@ -426,9 +457,7 @@ export class CpuMoveAiService {
       'Available moves:',
       moves,
       recentLog ? `Recent battle log (brief):\n${recentLog}` : '',
-      CPU_MOVE_SYSTEM_INSTRUCTIONS[1],
-      CPU_MOVE_SYSTEM_INSTRUCTIONS[2],
-      CPU_MOVE_SYSTEM_INSTRUCTIONS[3],
+      ...trailingInstructions,
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -436,7 +465,8 @@ export class CpuMoveAiService {
 
   private buildActionPrompt(
     input: CpuActionDecisionInput,
-    legalSwitches: CpuSwitchDecisionOption[]
+    legalSwitches: CpuSwitchDecisionOption[],
+    reasoning = false
   ): string {
     const moveLines = input.availableMoves
       .map(
@@ -462,6 +492,10 @@ export class CpuMoveAiService {
       )
       .join('\n');
 
+    const trailingInstructions = reasoning
+      ? [CPU_ACTION_REASONING_SYSTEM_INSTRUCTIONS[1]]
+      : [CPU_ACTION_SYSTEM_INSTRUCTIONS[1], CPU_ACTION_SYSTEM_INSTRUCTIONS[2], CPU_ACTION_SYSTEM_INSTRUCTIONS[3]];
+
     const recentLog = (input.recentLog ?? []).slice(-4).join('\n');
     return [
       `Turn: ${input.turn}`,
@@ -481,9 +515,7 @@ export class CpuMoveAiService {
         ? `Legal switches:\n${switchLines}`
         : 'No legal switches this turn.',
       recentLog ? `Recent log:\n${recentLog}` : '',
-      CPU_ACTION_SYSTEM_INSTRUCTIONS[1],
-      CPU_ACTION_SYSTEM_INSTRUCTIONS[2],
-      CPU_ACTION_SYSTEM_INSTRUCTIONS[3],
+      ...trailingInstructions,
     ]
       .filter(Boolean)
       .join('\n\n');
