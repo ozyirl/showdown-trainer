@@ -160,7 +160,7 @@ export function validateCreateTeamDto(body: unknown): CreateTeamDto {
     name: ensureString(payload.name, 'name'),
     format:
       payload.format == null ? undefined : ensureString(payload.format, 'format'),
-    notes: payload.notes == null ? undefined : ensureString(payload.notes, 'notes'),
+    notes: payload.notes == null ? undefined : ensureString(payload.notes, 'notes', false),
     slots: normalizeSlots(payload.slots),
   };
 }

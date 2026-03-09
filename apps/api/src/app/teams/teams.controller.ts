@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -11,16 +12,27 @@ import {
 } from '@nestjs/common';
 import { ClerkAuthGuard, CurrentUser, type ClerkUser } from '@org/common';
 import { TeamsService } from './teams.service';
+import { TeambuilderAiService } from './teambuilder-ai.service';
 import { validateCreateTeamDto, validateUpdateTeamDto } from './teams.validation';
+import type { TeambuilderChatRequest } from './teambuilder-ai.types';
 
 @UseGuards(ClerkAuthGuard)
 @Controller('teams')
 export class TeamsController {
-  constructor(private readonly teamsService: TeamsService) {}
+  constructor(
+    private readonly teamsService: TeamsService,
+    private readonly teambuilderAiService: TeambuilderAiService,
+  ) {}
 
   @Get()
   async listTeams(@CurrentUser() user: ClerkUser) {
     return this.teamsService.listTeams(user.userId);
+  }
+
+  @Post('chat')
+  async chat(@CurrentUser() _user: ClerkUser, @Body() body: unknown) {
+    const request = this.validateChatRequest(body);
+    return this.teambuilderAiService.chat(request);
   }
 
   @Get(':id')
@@ -57,5 +69,34 @@ export class TeamsController {
   @Delete(':id')
   async deleteTeam(@CurrentUser() user: ClerkUser, @Param('id') id: string) {
     return this.teamsService.deleteTeam(user.userId, id);
+  }
+
+  private validateChatRequest(body: unknown): TeambuilderChatRequest {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new BadRequestException('Request body must be an object');
+    }
+    const data = body as Record<string, unknown>;
+    if (!Array.isArray(data.messages) || data.messages.length === 0) {
+      throw new BadRequestException('messages must be a non-empty array');
+    }
+    for (const msg of data.messages) {
+      if (
+        !msg ||
+        typeof msg !== 'object' ||
+        (msg.role !== 'user' && msg.role !== 'assistant') ||
+        typeof msg.content !== 'string'
+      ) {
+        throw new BadRequestException(
+          'Each message must have role ("user"|"assistant") and content (string)',
+        );
+      }
+    }
+    return {
+      messages: data.messages,
+      currentSlots: Array.isArray(data.currentSlots)
+        ? data.currentSlots
+        : undefined,
+      format: typeof data.format === 'string' ? data.format : undefined,
+    } as TeambuilderChatRequest;
   }
 }
