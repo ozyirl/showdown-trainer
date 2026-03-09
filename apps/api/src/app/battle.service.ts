@@ -32,6 +32,7 @@ export interface PokemonMoveItem {
 
 export type CopilotMode = 'off' | 'coach' | 'deep';
 export type CpuModelProfile = 'fast' | 'reasoning';
+export type GameMode = 'pvp' | 'ai-vs-ai';
 
 export interface StartBattleRequest {
   p1Team?: StartBattleTeamInput[];
@@ -39,6 +40,7 @@ export interface StartBattleRequest {
   copilotEnabled?: boolean;
   copilotMode?: CopilotMode;
   cpuModelProfile?: CpuModelProfile;
+  gameMode?: GameMode;
   p1TeamPreviewChoice?: string;
   p2TeamPreviewChoice?: string;
   randomTeams?: boolean;
@@ -83,6 +85,12 @@ export function normalizeCpuModelProfile(
     default:
       return undefined;
   }
+}
+
+export function normalizeGameMode(
+  value?: string | null
+): GameMode {
+  return (value ?? '').trim().toLowerCase() === 'ai-vs-ai' ? 'ai-vs-ai' : 'pvp';
 }
 
 export function resolveRandomTeamFormatId(value?: string | null): string {

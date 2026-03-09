@@ -11,10 +11,12 @@ import {
   StartBattleRequest,
   normalizeCopilotMode,
   normalizeCpuModelProfile,
+  normalizeGameMode,
   resolveBattleFormatId,
   resolveRandomTeamFormatId,
   type CopilotMode,
   type CpuModelProfile,
+  type GameMode,
   type ShowdownLegalOptions,
   type ShowdownRequest,
 } from './battle.service';
@@ -136,6 +138,8 @@ export interface BattleState {
     truncated?: boolean;
     turn: number;
   } | null;
+  lastP1AiDecision: BattleState['lastCpuDecision'];
+  gameMode: GameMode;
 }
 
 export interface BattleTurnEvent {
@@ -250,6 +254,7 @@ class BattleSession {
   copilotEnabled = true;
   copilotMode?: CopilotMode;
   cpuModelProfile?: CpuModelProfile;
+  gameMode: GameMode = 'pvp';
   p1Choice: string | null = null;
   p2Choice: string | null = null;
   turnLog: string[] = [];
@@ -258,6 +263,7 @@ class BattleSession {
   lastAction: BattleState['lastAction'] = null;
   lastTurnEvents: BattleTurnEvent[] = [];
   lastCpuDecision: BattleState['lastCpuDecision'] = null;
+  lastP1AiDecision: BattleState['lastCpuDecision'] = null;
   isResolving = false;
   phase: BattleState['phase'] = 'awaiting-actions';
   eventLog: BattlePlaybackEvent[] = [];
@@ -412,6 +418,7 @@ export class BattleSessionManager {
     session.copilotEnabled = config?.copilotEnabled ?? copilotMode !== 'off';
     session.copilotMode = copilotMode;
     session.cpuModelProfile = cpuModelProfile;
+    session.gameMode = normalizeGameMode(config?.gameMode);
 
     session.lastLogIndex = battle.log.length;
     session.currentTurn = (battle as unknown as { turn?: number }).turn ?? 0;
@@ -554,15 +561,20 @@ export class BattleSessionManager {
     const p2NeedsChoice = this.playerNeedsChoice('p2', p2Legal);
 
     if (p1NeedsChoice) {
-      throw new BadRequestException('Player action required before continuing');
+      if (session.gameMode !== 'ai-vs-ai') {
+        throw new BadRequestException('Player action required before continuing');
+      }
+      await this.tryChooseAiAction(session, 'p1', requests);
     }
-    if (!p2NeedsChoice) {
+    if (!p2NeedsChoice && !p1NeedsChoice) {
       return this.getBattleState(battleId);
     }
 
     session.isResolving = true;
     try {
-      await this.tryChooseCpuAction(session, requests);
+      if (p2NeedsChoice && !session.hasChoice('p2')) {
+        await this.tryChooseAiAction(session, 'p2', requests);
+      }
       this.autofillNonActionableChoices(session, requests);
       if (!this.isReadyToResolve(session, requests)) {
         session.isResolving = false;
@@ -818,6 +830,8 @@ export class BattleSessionManager {
       lastAction: session.lastAction,
       lastTurnEvents: session.lastTurnEvents,
       lastCpuDecision: session.lastCpuDecision,
+      lastP1AiDecision: session.lastP1AiDecision,
+      gameMode: session.gameMode,
     };
   }
 
@@ -1346,16 +1360,29 @@ export class BattleSessionManager {
     session: BattleSession,
     requests: { p1: ShowdownRequest; p2: ShowdownRequest }
   ): Promise<void> {
-    const p2Legal = this.battleService.getLegalOptionsForRequest(requests.p2);
-    if (!p2Legal.needsChoice || p2Legal.wait) {
-      session.setChoice('p2', 'default');
+    return this.tryChooseAiAction(session, 'p2', requests);
+  }
+
+  private async tryChooseAiAction(
+    session: BattleSession,
+    side: 'p1' | 'p2',
+    requests: { p1: ShowdownRequest; p2: ShowdownRequest }
+  ): Promise<void> {
+    const sideIndex = side === 'p1' ? 0 : 1;
+    const opponentIndex = 1 - sideIndex;
+    const legal = this.battleService.getLegalOptionsForRequest(requests[side]);
+    const decisionField: 'lastCpuDecision' | 'lastP1AiDecision' =
+      side === 'p2' ? 'lastCpuDecision' : 'lastP1AiDecision';
+
+    if (!legal.needsChoice || legal.wait) {
+      session.setChoice(side, 'default');
       return;
     }
 
-    if (p2Legal.teamPreview) {
-      const teamChoice = this.pickDefaultChoice(p2Legal);
-      session.setChoice('p2', teamChoice);
-      session.lastCpuDecision = {
+    if (legal.teamPreview) {
+      const teamChoice = this.pickDefaultChoice(legal);
+      session.setChoice(side, teamChoice);
+      session[decisionField] = {
         choice: teamChoice,
         actionType: 'team',
         source: 'fallback',
@@ -1368,23 +1395,24 @@ export class BattleSessionManager {
     }
 
     const battle = session.battle as unknown as BattleWithDex;
-    const p1Active = battle.sides?.[0]?.active?.[0];
-    const p2Active = battle.sides?.[1]?.active?.[0];
-    const p2MoveChoices = this.getLegalCpuMoveChoices(
+    const selfActive = battle.sides?.[sideIndex]?.active?.[0];
+    const opponentActive = battle.sides?.[opponentIndex]?.active?.[0];
+    const moveChoices = this.getLegalMoveChoicesForSide(
       battle,
       requests,
-      p2Legal
+      side,
+      legal
     );
-    const p2SwitchChoices = this.getLegalCpuSwitchChoices(requests.p2, p2Legal);
+    const switchChoices = this.getLegalCpuSwitchChoices(requests[side], legal);
 
     if (!this.isCpuAiEnabled()) {
       const fallback = this.getFallbackCpuChoice(
-        p2MoveChoices,
-        p2SwitchChoices,
-        !!p2Legal.forceSwitch
+        moveChoices,
+        switchChoices,
+        !!legal.forceSwitch
       );
-      session.setChoice('p2', fallback.choice);
-      session.lastCpuDecision = {
+      session.setChoice(side, fallback.choice);
+      session[decisionField] = {
         choice: fallback.choice,
         actionType: fallback.actionType,
         source: 'fallback',
@@ -1401,21 +1429,21 @@ export class BattleSessionManager {
         battleId: session.id,
         turn: session.currentTurn + 1,
         modelProfile: session.cpuModelProfile,
-        cpuPokemonName: p2Active?.name || 'Unknown',
-        playerPokemonName: p1Active?.name || 'Unknown',
-        forceSwitch: !!p2Legal.forceSwitch,
-        availableMoves: p2MoveChoices,
-        availableSwitches: p2SwitchChoices,
+        cpuPokemonName: selfActive?.name || 'Unknown',
+        playerPokemonName: opponentActive?.name || 'Unknown',
+        forceSwitch: !!legal.forceSwitch,
+        availableMoves: moveChoices,
+        availableSwitches: switchChoices,
         recentLog: session.turnLog.slice(-4),
         cpuPokemonTypes: this.getPokemonTypes(
-          session.battle.sides[1]?.active?.[0]
+          session.battle.sides[sideIndex]?.active?.[0]
         ),
         playerPokemonTypes: this.getPokemonTypes(
-          session.battle.sides[0]?.active?.[0]
+          session.battle.sides[opponentIndex]?.active?.[0]
         ),
       });
-      session.setChoice('p2', decision.choice);
-      session.lastCpuDecision = {
+      session.setChoice(side, decision.choice);
+      session[decisionField] = {
         choice: decision.choice,
         actionType: decision.actionType,
         source: decision.source,
@@ -1433,12 +1461,12 @@ export class BattleSessionManager {
       }
       const message = error instanceof Error ? error.message : 'Unknown error';
       const fallback = this.getFallbackCpuChoice(
-        p2MoveChoices,
-        p2SwitchChoices,
-        !!p2Legal.forceSwitch
+        moveChoices,
+        switchChoices,
+        !!legal.forceSwitch
       );
-      session.setChoice('p2', fallback.choice);
-      session.lastCpuDecision = {
+      session.setChoice(side, fallback.choice);
+      session[decisionField] = {
         choice: fallback.choice,
         actionType: fallback.actionType,
         source: 'fallback',
@@ -1451,10 +1479,11 @@ export class BattleSessionManager {
     }
   }
 
-  private getLegalCpuMoveChoices(
+  private getLegalMoveChoicesForSide(
     battle: BattleWithDex,
     requests: { p1: ShowdownRequest; p2: ShowdownRequest },
-    p2Legal: ShowdownLegalOptions
+    side: 'p1' | 'p2',
+    legal: ShowdownLegalOptions
   ): Array<{
     index: number;
     name: string;
@@ -1464,10 +1493,11 @@ export class BattleSessionManager {
     effectivenessMultiplier?: number;
     isImmune?: boolean;
   }> {
-    const p1Active = battle.sides?.[0]?.active?.[0];
-    const moveRequests = requests.p2.active?.[0]?.moves ?? [];
+    const opponentIndex = side === 'p1' ? 1 : 0;
+    const opponentActive = battle.sides?.[opponentIndex]?.active?.[0];
+    const moveRequests = requests[side].active?.[0]?.moves ?? [];
     const legalMoveIndices = new Set(
-      p2Legal.moveChoices
+      legal.moveChoices
         .map((choice) => {
           const match = choice.match(/^move\s+(\d+)$/i);
           return match ? Number(match[1]) : null;
@@ -1486,12 +1516,12 @@ export class BattleSessionManager {
         const moveType = dexMove?.type;
         const isImmune =
           !!moveType &&
-          !!p1Active &&
+          !!opponentActive &&
           !!battle.dex?.getImmunity &&
-          !battle.dex.getImmunity(moveType, p1Active);
+          !battle.dex.getImmunity(moveType, opponentActive);
         const typeMod =
-          !!moveType && !!p1Active && !!battle.dex?.getEffectiveness
-            ? battle.dex.getEffectiveness(moveType, p1Active)
+          !!moveType && !!opponentActive && !!battle.dex?.getEffectiveness
+            ? battle.dex.getEffectiveness(moveType, opponentActive)
             : 0;
 
         return {
