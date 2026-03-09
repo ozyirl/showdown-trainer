@@ -3,13 +3,13 @@
   "version": "0.0.0",
   "license": "MIT",
   "scripts": {
-    "start": "nx serve api",
-    "build": "nx build api",
-    "test": "nx test api",
-    "lint": "nx lint api",
-    "graph": "nx graph",
-    "affected:build": "nx affected -t build",
-    "affected:test": "nx affected -t test"
+    "start": "NX_NO_CLOUD=true nx serve api",
+    "build": "NX_NO_CLOUD=true nx build api",
+    "test": "NX_NO_CLOUD=true nx test api",
+    "lint": "NX_NO_CLOUD=true nx lint api",
+    "graph": "NX_NO_CLOUD=true nx graph",
+    "affected:build": "NX_NO_CLOUD=true nx affected -t build",
+    "affected:test": "NX_NO_CLOUD=true nx affected -t test"
   },
   "private": true,
   "devDependencies": {
