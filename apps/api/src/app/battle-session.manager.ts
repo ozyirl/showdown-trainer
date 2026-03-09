@@ -133,6 +133,7 @@ export interface BattleState {
     reasoning?: string;
     rawResponse?: string;
     error?: string;
+    truncated?: boolean;
     turn: number;
   } | null;
 }
@@ -1423,6 +1424,7 @@ export class BattleSessionManager {
         reasoning: decision.reasoning,
         rawResponse: decision.rawResponse,
         error: decision.error,
+        truncated: decision.truncated,
         turn: session.currentTurn + 1,
       };
     } catch (error) {

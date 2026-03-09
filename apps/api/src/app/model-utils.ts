@@ -27,11 +27,11 @@ export function getTokenBudget(
 
   switch (intent) {
     case 'move':
-      return reasoning ? 4096 : 80;
+      return reasoning ? 16384 : 80;
     case 'action':
-      return reasoning ? 4096 : 120;
+      return reasoning ? 16384 : 120;
     case 'copilot':
-      return reasoning ? 4096 : 400;
+      return reasoning ? 16384 : 400;
   }
 }
 

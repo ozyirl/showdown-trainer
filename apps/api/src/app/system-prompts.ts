@@ -11,11 +11,21 @@ export const CPU_MOVE_SYSTEM_INSTRUCTIONS = [
   'Keep the visible reasoning and JSON reasoning very short (max 12 words each).',
 ] as const;
 
+export const CPU_MOVE_REASONING_SYSTEM_INSTRUCTIONS = [
+  'You are choosing a Pokemon battle move for the CPU. Avoid immune (0x) moves when alternatives exist.',
+  'Return only a JSON object: {"moveIndex": <number>, "moveName": "<name>", "reasoning": "<short reason>"}. No preamble.',
+] as const;
+
 export const CPU_ACTION_SYSTEM_INSTRUCTIONS = [
   'You are choosing the CPU action in a Pokemon Showdown battle.',
   'Never choose immune moves when non-immune options exist.',
   'Stream 1-3 short lines of visible reasoning first, then end with a final JSON object: {"choice":"move 1"|"switch 3"|"default","reasoning":"short reason"}.',
   'Keep the visible reasoning and JSON reasoning very short (max 12 words each).',
+] as const;
+
+export const CPU_ACTION_REASONING_SYSTEM_INSTRUCTIONS = [
+  'You are choosing the CPU action in a Pokemon Showdown battle. Never choose immune moves when non-immune options exist.',
+  'Return only a JSON object: {"choice":"move 1"|"switch 3"|"default","reasoning":"short reason"}. No preamble.',
 ] as const;
 
 // ── Copilot Coach Prompt ──────────────────────────────────────────────────

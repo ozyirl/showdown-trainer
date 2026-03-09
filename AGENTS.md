@@ -11,3 +11,18 @@
 - If the user needs help with an Nx configuration or project graph error, use the `nx_workspace` tool to get any errors
 
 <!-- nx configuration end-->
+
+## Repo-Specific Workflows
+
+- Install dependencies with `npm ci` (matches CI workflow).
+- Common API shortcuts from root `package.json`:
+  - `npm run start` (`nx serve api`)
+  - `npm run build` (`nx build api`)
+  - `npm run test` (`nx test api`)
+  - `npm run lint` (`nx lint api`)
+  - `npm run graph` (`nx graph`)
+  - `npm run affected:build` (`nx affected -t build`)
+  - `npm run affected:test` (`nx affected -t test`)
+- E2E tests are defined on `api-e2e` as target `e2e` (`npx nx run api-e2e:e2e`).
+- CI currently runs `npx nx run-many -t lint test build typecheck e2e-ci`.
+  - TODO: confirm whether `e2e-ci` is an inferred alias in this workspace or should be `e2e` for local parity.
