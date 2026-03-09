@@ -9,7 +9,7 @@ async function bootstrap() {
 
   // Enable CORS for frontend
   app.enableCors({
-    origin: 'http://localhost:3000',
+    origin: ['http://localhost:3000', 'https://showdown-trainer-fe.vercel.app'],
     credentials: true,
   });
 
