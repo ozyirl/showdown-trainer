@@ -6,10 +6,17 @@ import { AppModule } from './app/app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  const allowedOrigins = (
+    process.env.CORS_ORIGINS ??
+    'http://localhost:3000,https://agentic-showdown.vercel.app,https://showdown-trainer-fe.vercel.app'
+  )
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
 
   // Enable CORS for frontend
   app.enableCors({
-    origin: ['http://localhost:3000', 'https://showdown-trainer-fe.vercel.app'],
+    origin: allowedOrigins,
     credentials: true,
   });
 
