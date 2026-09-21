@@ -18,9 +18,7 @@
     {
       "plugin": "@nx/js/typescript",
       "options": {
-        "typecheck": {
-          "targetName": "typecheck"
-        },
+        "typecheck": { "targetName": "typecheck" },
         "build": {
           "targetName": "build",
           "configName": "tsconfig.lib.json",
@@ -40,24 +38,13 @@
         "serveStaticTargetName": "serve-static"
       }
     },
-    {
-      "plugin": "@nx/eslint/plugin",
-      "options": {
-        "targetName": "lint"
-      }
-    },
+    { "plugin": "@nx/eslint/plugin", "options": { "targetName": "lint" } },
     {
       "plugin": "@nx/jest/plugin",
-      "options": {
-        "targetName": "test"
-      },
+      "options": { "targetName": "test" },
       "exclude": ["apps/api-e2e/**/*"]
     }
   ],
-  "nxCloudId": "69652d6340f42c0e6faf0f4b",
-  "targetDefaults": {
-    "test": {
-      "dependsOn": ["^build"]
-    }
-  }
+  "nxCloudId": "6ab192ca4cdc50ec73e0ab52",
+  "targetDefaults": { "test": { "dependsOn": ["^build"] } }
 }
