@@ -1,6 +1,9 @@
 import { BadRequestException } from '@nestjs/common';
 import { BattleService, type ShowdownRequest } from './battle.service';
-import { BattleSessionManager } from './battle-session.manager';
+import {
+  BattleSessionManager,
+  type BattleState,
+} from './battle-session.manager';
 import { CpuMoveAiService } from './cpu-move-ai.service';
 
 describe('BattleSessionManager 6v6 flow', () => {
@@ -18,16 +21,16 @@ describe('BattleSessionManager 6v6 flow', () => {
   async function ackUntilSettled(
     battleManager: BattleSessionManager,
     battleId: string,
-    state: { awaitingAckEventSeq: number | null }
-  ) {
+    state: BattleState
+  ): Promise<BattleState> {
     let current = state;
     let guard = 0;
     while (current.awaitingAckEventSeq !== null && guard < 100) {
       guard++;
-      current = (await battleManager.ackEvent(
+      current = await battleManager.ackEvent(
         battleId,
         current.awaitingAckEventSeq
-      )) as unknown as typeof current;
+      );
     }
     return current;
   }
