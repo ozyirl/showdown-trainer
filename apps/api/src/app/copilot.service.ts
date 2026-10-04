@@ -151,17 +151,19 @@ export class CopilotService {
 
     const prompt = this.buildUserPrompt(snapshot);
     const cacheKey = `${battleId}::${snapshot.turn}::${session.phase}`;
+    const reasoning = isReasoningModel(modelId, session.copilotMode === 'deep');
     return {
       snapshot,
       modelId,
       prompt,
       cacheKey,
+      reasoning,
       copilotEnabled: session.copilotEnabled,
     };
   }
 
   async getCopilotGuidance(battleId: string): Promise<CopilotGuidance> {
-    const { snapshot, modelId, prompt, cacheKey, copilotEnabled } =
+    const { snapshot, modelId, prompt, cacheKey, reasoning, copilotEnabled } =
       this.prepareCopilotCall(battleId);
 
     if (!copilotEnabled) {
@@ -192,10 +194,10 @@ export class CopilotService {
     const startedAt = Date.now();
     try {
       const { text: rawText } = await generateText({
-        model: createModel(modelId),
+        model: createModel(modelId, reasoning),
         system: COPILOT_SYSTEM_PROMPT,
         prompt,
-        maxOutputTokens: getTokenBudget(modelId, 'copilot'),
+        maxOutputTokens: getTokenBudget(modelId, 'copilot', reasoning),
       });
 
       const step1Ms = Date.now() - startedAt;
@@ -214,7 +216,7 @@ export class CopilotService {
         return directParsed;
       }
 
-      if (isReasoningModel(modelId)) {
+      if (reasoning) {
         const extractorResult = await this.extractWithLightweightModel(
           rawText,
           extractorModelId,
@@ -267,7 +269,7 @@ export class CopilotService {
           'Raw analysis:',
           rawText,
         ].join('\n'),
-        maxOutputTokens: 400,
+        maxOutputTokens: getTokenBudget(extractorModelId, 'copilot'),
       });
       return object;
     } catch (extractError) {

@@ -1,5 +1,11 @@
-import { openai } from '@ai-sdk/openai';
+import { createOpenAI } from '@ai-sdk/openai';
 import { jsonrepair } from 'jsonrepair';
+import {
+  DEFAULT_KIMI_MODEL,
+  getAiProvider,
+  getAiClientConfig,
+  getKimiRequestOptions,
+} from './ai-provider';
 import type { CopilotMode, CpuModelProfile } from './battle.service';
 
 // Known reasoning model families / prefixes.
@@ -8,10 +14,19 @@ const REASONING_MODEL_PATTERNS = [
   /^o[1-9]/, // o1, o3, o4-mini, etc.
   /^gpt-5/, // gpt-5-nano, gpt-5-mini, gpt-5, etc.
   /reasoning/i,
+  /^kimi-k3/,
+  /^kimi-k2\.7/,
+  /thinking/i,
 ];
 
-export function isReasoningModel(modelId: string): boolean {
-  return REASONING_MODEL_PATTERNS.some((p) => p.test(modelId));
+export function isReasoningModel(
+  modelId: string,
+  preferThinking = false
+): boolean {
+  return (
+    REASONING_MODEL_PATTERNS.some((p) => p.test(modelId)) ||
+    (modelId === DEFAULT_KIMI_MODEL && preferThinking)
+  );
 }
 
 /**
@@ -21,9 +36,13 @@ export function isReasoningModel(modelId: string): boolean {
  */
 export function getTokenBudget(
   modelId: string,
-  intent: 'move' | 'action' | 'copilot'
+  intent: 'move' | 'action' | 'copilot',
+  reasoning = isReasoningModel(modelId)
 ): number {
-  const reasoning = isReasoningModel(modelId);
+  // Leave enough space for Kimi's final JSON and user-visible rationale.
+  if (getAiProvider() === 'kimi') {
+    return reasoning ? 16384 : intent === 'copilot' ? 2048 : 512;
+  }
 
   switch (intent) {
     case 'move':
@@ -39,6 +58,14 @@ export function resolveModelId(
   envVar: string,
   fallback = 'gpt-4.1-mini'
 ): string {
+  if (getAiProvider() === 'kimi') {
+    const kimiEnvVar = envVar.replace(/^OPENAI_/, 'KIMI_');
+    return (
+      process.env[kimiEnvVar]?.trim() ||
+      process.env.KIMI_MODEL?.trim() ||
+      (fallback.startsWith('kimi-') ? fallback : DEFAULT_KIMI_MODEL)
+    );
+  }
   return process.env[envVar] || fallback;
 }
 
@@ -50,7 +77,10 @@ export function resolveCpuModelId(profile?: CpuModelProfile): string {
   if (profile === 'reasoning') {
     return resolveModelId(
       'OPENAI_CPU_REASONING_MODEL',
-      resolveModelId('OPENAI_CPU_MODEL', 'gpt-5-nano-2025-08-07')
+      resolveModelId(
+        'OPENAI_CPU_MODEL',
+        getAiProvider() === 'kimi' ? 'kimi-k3' : 'gpt-5-nano-2025-08-07'
+      )
     );
   }
 
@@ -80,11 +110,29 @@ export function resolveCopilotModelId(mode?: CopilotMode): string {
   );
 }
 
-export function createModel(modelId: string) {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY is not set');
+export function createModel(
+  modelId: string,
+  thinking = isReasoningModel(modelId)
+) {
+  const config = getAiClientConfig();
+  if (getAiProvider() === 'kimi') {
+    // The installed OpenAI adapter drops unknown provider options, so add
+    // Kimi's thinking configuration at the transport boundary.
+    return createOpenAI({
+      ...config,
+      fetch: (url, init) => {
+        const body = JSON.parse(init?.body as string);
+        return globalThis.fetch(url, {
+          ...init,
+          body: JSON.stringify({
+            ...body,
+            ...getKimiRequestOptions(modelId, thinking),
+          }),
+        });
+      },
+    }).chat(modelId);
   }
-  return openai(modelId);
+  return createOpenAI(config)(modelId);
 }
 
 /**

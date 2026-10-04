@@ -14,6 +14,7 @@ import {
   parseJsonFromModelOutput,
 } from './model-utils';
 import { getOpenAiClient } from './openai-client';
+import { getAiProvider, getKimiRequestOptions } from './ai-provider';
 import type { CpuModelProfile } from './battle.service';
 
 export interface CpuMoveDecisionInput {
@@ -134,7 +135,10 @@ export class CpuMoveAiService {
     const startedAt = Date.now();
 
     try {
-      const reasoning = isReasoningModel(modelId);
+      const reasoning = isReasoningModel(
+        modelId,
+        input.modelProfile === 'reasoning'
+      );
       const { text: rawText, truncated } = await this.streamCompletion({
         battleId: input.battleId,
         turn: input.turn,
@@ -143,7 +147,8 @@ export class CpuMoveAiService {
           ? CPU_MOVE_REASONING_SYSTEM_INSTRUCTIONS[0]
           : CPU_MOVE_SYSTEM_INSTRUCTIONS[0],
         prompt: this.buildMovePrompt(input, reasoning),
-        maxCompletionTokens: getTokenBudget(modelId, 'move'),
+        maxCompletionTokens: getTokenBudget(modelId, 'move', reasoning),
+        reasoning,
       });
 
       const parsed = this.parseMoveDecision(rawText, input);
@@ -255,7 +260,10 @@ export class CpuMoveAiService {
     );
 
     try {
-      const reasoning = isReasoningModel(modelId);
+      const reasoning = isReasoningModel(
+        modelId,
+        input.modelProfile === 'reasoning'
+      );
       const { text: rawText, truncated } = await this.streamCompletion({
         battleId: input.battleId,
         turn: input.turn,
@@ -264,7 +272,8 @@ export class CpuMoveAiService {
           ? CPU_ACTION_REASONING_SYSTEM_INSTRUCTIONS[0]
           : CPU_ACTION_SYSTEM_INSTRUCTIONS[0],
         prompt: this.buildActionPrompt(input, legalSwitches, reasoning),
-        maxCompletionTokens: getTokenBudget(modelId, 'action'),
+        maxCompletionTokens: getTokenBudget(modelId, 'action', reasoning),
+        reasoning,
       });
 
       const parsed = this.parseActionDecision(
@@ -334,6 +343,7 @@ export class CpuMoveAiService {
     systemInstruction: string;
     prompt: string;
     maxCompletionTokens: number;
+    reasoning: boolean;
   }): Promise<{ text: string; truncated: boolean }> {
     const stream = this.ensureBattleStream(params.battleId);
     stream.next({
@@ -353,7 +363,9 @@ export class CpuMoveAiService {
       messages,
       stream: true,
       max_completion_tokens: params.maxCompletionTokens,
-      ...(isReasoningModel(params.modelId) && { reasoning_effort: 'medium' }),
+      ...(getAiProvider() === 'openai' &&
+        params.reasoning && { reasoning_effort: 'medium' as const }),
+      ...getKimiRequestOptions(params.modelId, params.reasoning),
     });
 
     let fullText = '';

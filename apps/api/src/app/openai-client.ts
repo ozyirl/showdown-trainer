@@ -1,17 +1,19 @@
 import OpenAI from 'openai';
+import { getAiClientConfig } from './ai-provider';
 
-let openAiClient: OpenAI | null = null;
+let cachedClient: { apiKey: string; baseURL?: string; client: OpenAI } | null =
+  null;
 
 export function getOpenAiClient(): OpenAI {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY is not set');
+  const config = getAiClientConfig();
+
+  if (
+    !cachedClient ||
+    cachedClient.apiKey !== config.apiKey ||
+    cachedClient.baseURL !== config.baseURL
+  ) {
+    cachedClient = { ...config, client: new OpenAI(config) };
   }
 
-  if (!openAiClient) {
-    openAiClient = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
-  }
-
-  return openAiClient;
+  return cachedClient.client;
 }

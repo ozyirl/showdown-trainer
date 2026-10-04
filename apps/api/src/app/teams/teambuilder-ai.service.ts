@@ -1,10 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
-import OpenAI from 'openai';
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from 'openai/resources/chat/completions';
 import { resolveModelId } from '../model-utils';
+import { getOpenAiClient } from '../openai-client';
+import { getKimiRequestOptions } from '../ai-provider';
 import type { TeamPokemonSlot, StatSpread } from './teams.types';
 import type {
   TeambuilderChatRequest,
@@ -192,11 +193,11 @@ function buildContextMessage(
 @Injectable()
 export class TeambuilderAiService {
   private readonly logger = new Logger(TeambuilderAiService.name);
-  private readonly client = new OpenAI();
 
   async chat(
     request: TeambuilderChatRequest
   ): Promise<TeambuilderChatResponse> {
+    const client = getOpenAiClient();
     const modelId = resolveModelId(
       'OPENAI_TEAMBUILDER_MODEL',
       'gpt-4.1-nano-2025-04-14'
@@ -220,10 +221,11 @@ export class TeambuilderAiService {
     const startMs = Date.now();
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const completion = await this.client.chat.completions.create({
+      const completion = await client.chat.completions.create({
         model: modelId,
         messages,
         tools: TOOLS,
+        ...getKimiRequestOptions(modelId),
       });
 
       const choice = completion.choices[0];
