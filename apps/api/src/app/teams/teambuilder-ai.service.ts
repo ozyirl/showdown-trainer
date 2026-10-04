@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import OpenAI from 'openai';
-import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from 'openai/resources/chat/completions';
 import { resolveModelId } from '../model-utils';
 import type { TeamPokemonSlot, StatSpread } from './teams.types';
 import type {
@@ -25,7 +28,7 @@ Rules:
 const STAT_SPREAD_SCHEMA = {
   type: 'object' as const,
   properties: {
-    hp:  { type: 'integer' as const },
+    hp: { type: 'integer' as const },
     atk: { type: 'integer' as const },
     def: { type: 'integer' as const },
     spa: { type: 'integer' as const },
@@ -40,11 +43,15 @@ const TOOLS: ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'lookupPokemon',
-      description: 'Look up a Pokemon by name to get its types, base stats, abilities, tier, and weight.',
+      description:
+        'Look up a Pokemon by name to get its types, base stats, abilities, tier, and weight.',
       parameters: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'Pokemon name, e.g. "Garchomp"' },
+          name: {
+            type: 'string',
+            description: 'Pokemon name, e.g. "Garchomp"',
+          },
         },
         required: ['name'],
         additionalProperties: false,
@@ -55,11 +62,15 @@ const TOOLS: ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'lookupMoves',
-      description: "Get a Pokemon's learnable moves with type, power, category, accuracy, and PP.",
+      description:
+        "Get a Pokemon's learnable moves with type, power, category, accuracy, and PP.",
       parameters: {
         type: 'object',
         properties: {
-          pokemon: { type: 'string', description: 'Pokemon name, e.g. "Garchomp"' },
+          pokemon: {
+            type: 'string',
+            description: 'Pokemon name, e.g. "Garchomp"',
+          },
         },
         required: ['pokemon'],
         additionalProperties: false,
@@ -74,7 +85,10 @@ const TOOLS: ChatCompletionTool[] = [
       parameters: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'Item name, e.g. "Choice Scarf"' },
+          name: {
+            type: 'string',
+            description: 'Item name, e.g. "Choice Scarf"',
+          },
         },
         required: ['name'],
         additionalProperties: false,
@@ -89,7 +103,10 @@ const TOOLS: ChatCompletionTool[] = [
       parameters: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'Ability name, e.g. "Rough Skin"' },
+          name: {
+            type: 'string',
+            description: 'Ability name, e.g. "Rough Skin"',
+          },
         },
         required: ['name'],
         additionalProperties: false,
@@ -100,19 +117,30 @@ const TOOLS: ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'setTeamSlot',
-      description: 'Add or update a Pokemon in a team slot. Call this when the user confirms a Pokemon.',
+      description:
+        'Add or update a Pokemon in a team slot. Call this when the user confirms a Pokemon.',
       parameters: {
         type: 'object',
         properties: {
-          slot:     { type: 'integer', description: 'Team slot number (1-6)' },
-          species:  { type: 'string', description: 'Pokemon species name' },
-          moves:    { type: 'array', items: { type: 'string' }, description: 'Array of 1-4 move names' },
-          item:     { type: 'string', description: 'Held item name' },
-          ability:  { type: 'string', description: 'Ability name' },
-          nature:   { type: 'string', description: 'Nature name, e.g. "Jolly"' },
+          slot: { type: 'integer', description: 'Team slot number (1-6)' },
+          species: { type: 'string', description: 'Pokemon species name' },
+          moves: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Array of 1-4 move names',
+          },
+          item: { type: 'string', description: 'Held item name' },
+          ability: { type: 'string', description: 'Ability name' },
+          nature: { type: 'string', description: 'Nature name, e.g. "Jolly"' },
           teraType: { type: 'string', description: 'Tera type, e.g. "Fire"' },
-          evs:      { ...STAT_SPREAD_SCHEMA, description: 'EV spread (0-252 per stat)' },
-          ivs:      { ...STAT_SPREAD_SCHEMA, description: 'IV spread (0-31 per stat, defaults to 31)' },
+          evs: {
+            ...STAT_SPREAD_SCHEMA,
+            description: 'EV spread (0-252 per stat)',
+          },
+          ivs: {
+            ...STAT_SPREAD_SCHEMA,
+            description: 'IV spread (0-31 per stat, defaults to 31)',
+          },
         },
         required: ['slot', 'species', 'moves'],
         additionalProperties: false,
@@ -123,7 +151,7 @@ const TOOLS: ChatCompletionTool[] = [
 
 function buildContextMessage(
   currentSlots: TeamPokemonSlot[] | undefined,
-  format: string | undefined,
+  format: string | undefined
 ): string {
   const parts: string[] = [];
   if (format) {
@@ -136,18 +164,27 @@ function buildContextMessage(
         .map((s, idx) => {
           const slotNum = s.slot ?? idx + 1;
           if (!s.species?.trim()) return `Slot ${slotNum}: (empty)`;
-          const movesStr = (s.moves ?? []).filter(Boolean).join(', ') || 'no moves';
-          return `Slot ${slotNum}: ${s.species} (${movesStr})${s.item ? ` @ ${s.item}` : ''}${s.ability ? ` [${s.ability}]` : ''}`;
+          const movesStr =
+            (s.moves ?? []).filter(Boolean).join(', ') || 'no moves';
+          return `Slot ${slotNum}: ${s.species} (${movesStr})${
+            s.item ? ` @ ${s.item}` : ''
+          }${s.ability ? ` [${s.ability}]` : ''}`;
         })
         .join('\n');
-      parts.push(`Current team (${filledSlots.length}/6 filled):\n${teamSummary}`);
+      parts.push(
+        `Current team (${filledSlots.length}/6 filled):\n${teamSummary}`
+      );
       const nextSlot = currentSlots.length < 6 ? currentSlots.length + 1 : null;
       if (nextSlot) parts.push(`Next available slot: ${nextSlot}`);
     } else {
-      parts.push('Current team: empty (0/6 slots filled). Start adding Pokemon to slot 1.');
+      parts.push(
+        'Current team: empty (0/6 slots filled). Start adding Pokemon to slot 1.'
+      );
     }
   } else {
-    parts.push('Current team: empty (0/6 slots filled). Start adding Pokemon to slot 1.');
+    parts.push(
+      'Current team: empty (0/6 slots filled). Start adding Pokemon to slot 1.'
+    );
   }
   return parts.join('\n\n');
 }
@@ -157,11 +194,19 @@ export class TeambuilderAiService {
   private readonly logger = new Logger(TeambuilderAiService.name);
   private readonly client = new OpenAI();
 
-  async chat(request: TeambuilderChatRequest): Promise<TeambuilderChatResponse> {
-    const modelId = resolveModelId('OPENAI_TEAMBUILDER_MODEL', 'gpt-4.1-nano-2025-04-14');
+  async chat(
+    request: TeambuilderChatRequest
+  ): Promise<TeambuilderChatResponse> {
+    const modelId = resolveModelId(
+      'OPENAI_TEAMBUILDER_MODEL',
+      'gpt-4.1-nano-2025-04-14'
+    );
     const slotUpdates: TeamPokemonSlot[] = [];
 
-    const contextMessage = buildContextMessage(request.currentSlots, request.format);
+    const contextMessage = buildContextMessage(
+      request.currentSlots,
+      request.format
+    );
 
     const messages: ChatCompletionMessageParam[] = [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -186,13 +231,20 @@ export class TeambuilderAiService {
 
       messages.push(choice.message);
 
-      if (choice.finish_reason !== 'tool_calls' || !choice.message.tool_calls?.length) {
+      if (
+        choice.finish_reason !== 'tool_calls' ||
+        !choice.message.tool_calls?.length
+      ) {
         const latencyMs = Date.now() - startMs;
         this.logger.debug(
-          `Teambuilder chat (${modelId}, ${latencyMs}ms, ${round + 1} rounds): ${slotUpdates.length} slot updates`,
+          `Teambuilder chat (${modelId}, ${latencyMs}ms, ${
+            round + 1
+          } rounds): ${slotUpdates.length} slot updates`
         );
         return {
-          message: choice.message.content || 'I could not generate a response. Please try again.',
+          message:
+            choice.message.content ||
+            'I could not generate a response. Please try again.',
           slotUpdates,
         };
       }
@@ -206,7 +258,9 @@ export class TeambuilderAiService {
         try {
           result = await this.executeTool(fn.name, args, slotUpdates);
         } catch (err) {
-          result = { error: err instanceof Error ? err.message : 'Tool execution failed' };
+          result = {
+            error: err instanceof Error ? err.message : 'Tool execution failed',
+          };
         }
 
         messages.push({
@@ -218,9 +272,12 @@ export class TeambuilderAiService {
     }
 
     const latencyMs = Date.now() - startMs;
-    this.logger.warn(`Teambuilder chat hit max rounds (${MAX_TOOL_ROUNDS}, ${latencyMs}ms)`);
+    this.logger.warn(
+      `Teambuilder chat hit max rounds (${MAX_TOOL_ROUNDS}, ${latencyMs}ms)`
+    );
     return {
-      message: 'I ran out of steps. Please try a simpler request or continue the conversation.',
+      message:
+        'I ran out of steps. Please try a simpler request or continue the conversation.',
       slotUpdates,
     };
   }
@@ -228,7 +285,7 @@ export class TeambuilderAiService {
   private async executeTool(
     name: string,
     args: Record<string, unknown>,
-    slotUpdates: TeamPokemonSlot[],
+    slotUpdates: TeamPokemonSlot[]
   ): Promise<unknown> {
     switch (name) {
       case 'lookupPokemon':
@@ -240,8 +297,12 @@ export class TeambuilderAiService {
       case 'lookupAbility':
         return this.lookupAbility(args.name as string);
       case 'setTeamSlot': {
-        const validated = await this.validateAndBuildSlot(args as SetTeamSlotArgs);
-        const existingIdx = slotUpdates.findIndex((s) => s.slot === validated.slot);
+        const validated = await this.validateAndBuildSlot(
+          args as SetTeamSlotArgs
+        );
+        const existingIdx = slotUpdates.findIndex(
+          (s) => s.slot === validated.slot
+        );
         if (existingIdx >= 0) {
           slotUpdates[existingIdx] = validated;
         } else {
@@ -321,7 +382,9 @@ export class TeambuilderAiService {
     };
   }
 
-  private async validateAndBuildSlot(params: SetTeamSlotArgs): Promise<TeamPokemonSlot> {
+  private async validateAndBuildSlot(
+    params: SetTeamSlotArgs
+  ): Promise<TeamPokemonSlot> {
     const { Dex } = await import('pokemon-showdown');
 
     const species = Dex.species.get(params.species);

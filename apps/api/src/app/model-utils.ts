@@ -5,8 +5,8 @@ import type { CopilotMode, CpuModelProfile } from './battle.service';
 // Known reasoning model families / prefixes.
 // Extend this list as new reasoning models ship.
 const REASONING_MODEL_PATTERNS = [
-  /^o[1-9]/,           // o1, o3, o4-mini, etc.
-  /^gpt-5/,            // gpt-5-nano, gpt-5-mini, gpt-5, etc.
+  /^o[1-9]/, // o1, o3, o4-mini, etc.
+  /^gpt-5/, // gpt-5-nano, gpt-5-mini, gpt-5, etc.
   /reasoning/i,
 ];
 
@@ -21,7 +21,7 @@ export function isReasoningModel(modelId: string): boolean {
  */
 export function getTokenBudget(
   modelId: string,
-  intent: 'move' | 'action' | 'copilot',
+  intent: 'move' | 'action' | 'copilot'
 ): number {
   const reasoning = isReasoningModel(modelId);
 
@@ -37,7 +37,7 @@ export function getTokenBudget(
 
 export function resolveModelId(
   envVar: string,
-  fallback = 'gpt-4.1-mini',
+  fallback = 'gpt-4.1-mini'
 ): string {
   return process.env[envVar] || fallback;
 }
@@ -63,20 +63,14 @@ export function resolveCopilotModelId(mode?: CopilotMode): string {
   if (effectiveMode === 'deep') {
     return resolveModelId(
       'OPENAI_COPILOT_DEEP_MODEL',
-      resolveModelId(
-        'OPENAI_COPILOT_MODEL',
-        resolveCpuModelId('reasoning')
-      )
+      resolveModelId('OPENAI_COPILOT_MODEL', resolveCpuModelId('reasoning'))
     );
   }
 
   if (effectiveMode === 'coach') {
     return resolveModelId(
       'OPENAI_COPILOT_COACH_MODEL',
-      resolveModelId(
-        'OPENAI_COPILOT_MODEL',
-        resolveCpuModelId('fast')
-      )
+      resolveModelId('OPENAI_COPILOT_MODEL', resolveCpuModelId('fast'))
     );
   }
 
@@ -101,7 +95,10 @@ export function extractJsonFromModelOutput(text: string): string {
   let cleaned = text;
 
   // Strip <think>...</think> or <reasoning>...</reasoning> wrapper blocks
-  cleaned = cleaned.replace(/<(?:think|thinking|reasoning)>[\s\S]*?<\/(?:think|thinking|reasoning)>/gi, '');
+  cleaned = cleaned.replace(
+    /<(?:think|thinking|reasoning)>[\s\S]*?<\/(?:think|thinking|reasoning)>/gi,
+    ''
+  );
 
   // Strip markdown code fences: ```json ... ``` or ``` ... ```
   const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -117,7 +114,9 @@ export function extractJsonFromModelOutput(text: string): string {
  * Tries direct parse, then extracts from wrapped output, then
  * falls back to greedy brace matching.
  */
-export function parseJsonFromModelOutput(text: string): Record<string, unknown> | null {
+export function parseJsonFromModelOutput(
+  text: string
+): Record<string, unknown> | null {
   const cleaned = extractJsonFromModelOutput(text);
 
   // Direct parse
@@ -162,7 +161,8 @@ function tryRepairJson(text: string): Record<string, unknown> | null {
 function safeJsonParse(text: string): Record<string, unknown> | null {
   try {
     const value = JSON.parse(text) as unknown;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      return null;
     return value as Record<string, unknown>;
   } catch {
     return null;

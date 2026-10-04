@@ -151,7 +151,13 @@ export class CopilotService {
 
     const prompt = this.buildUserPrompt(snapshot);
     const cacheKey = `${battleId}::${snapshot.turn}::${session.phase}`;
-    return { snapshot, modelId, prompt, cacheKey, copilotEnabled: session.copilotEnabled };
+    return {
+      snapshot,
+      modelId,
+      prompt,
+      cacheKey,
+      copilotEnabled: session.copilotEnabled,
+    };
   }
 
   async getCopilotGuidance(battleId: string): Promise<CopilotGuidance> {
@@ -180,7 +186,7 @@ export class CopilotService {
 
     const extractorModelId = resolveModelId(
       'OPENAI_COPILOT_EXTRACTOR_MODEL',
-      'gpt-4.1-nano',
+      'gpt-4.1-nano'
     );
 
     const startedAt = Date.now();
@@ -200,7 +206,9 @@ export class CopilotService {
       const directParsed = this.parseGuidanceFromText(rawText);
       if (directParsed) {
         this.logger.debug(
-          `Copilot direct parse OK (${Date.now() - startedAt}ms): ${directParsed.recommendedAction} [${directParsed.confidence}]`
+          `Copilot direct parse OK (${Date.now() - startedAt}ms): ${
+            directParsed.recommendedAction
+          } [${directParsed.confidence}]`
         );
         this.guidanceCache.set(cacheKey, directParsed);
         return directParsed;
@@ -210,7 +218,7 @@ export class CopilotService {
         const extractorResult = await this.extractWithLightweightModel(
           rawText,
           extractorModelId,
-          snapshot,
+          snapshot
         );
         const totalMs = Date.now() - startedAt;
         this.logger.debug(
@@ -245,7 +253,7 @@ export class CopilotService {
   private async extractWithLightweightModel(
     rawText: string,
     extractorModelId: string,
-    snapshot: CopilotBattleSnapshot,
+    snapshot: CopilotBattleSnapshot
   ): Promise<CopilotGuidance> {
     try {
       const { object } = await generateObject({
@@ -313,7 +321,7 @@ export class CopilotService {
   }
 
   private parseAlternative(
-    val: unknown,
+    val: unknown
   ): { action: string; label: string; reason: string } | null {
     if (!val || typeof val !== 'object') return null;
     const obj = val as Record<string, unknown>;
