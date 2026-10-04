@@ -4,6 +4,30 @@
 
 ✨ Your new, shiny [Nx workspace](https://nx.dev) is ready ✨.
 
+## AI provider setup
+
+Set `KIMI_API_KEY` in the root `.env` to use Kimi for CPU decisions, battle
+coaching, and teambuilding. Kimi is selected automatically when its key is
+present; `AI_PROVIDER=kimi` makes that choice explicit even when an OpenAI key
+is also configured. Restart the API with `npm run start` after changing `.env`.
+
+The fast CPU, coach, extractor, and teambuilder use `kimi-k2.6` with thinking
+disabled. The reasoning CPU and deep coach use `kimi-k3` with high reasoning
+effort. Configure individual roles with `KIMI_CPU_MODEL`, `KIMI_CPU_FAST_MODEL`,
+`KIMI_CPU_REASONING_MODEL`, `KIMI_COPILOT_MODEL`, `KIMI_COPILOT_COACH_MODEL`,
+`KIMI_COPILOT_DEEP_MODEL`, `KIMI_COPILOT_EXTRACTOR_MODEL`, or
+`KIMI_TEAMBUILDER_MODEL`. `KIMI_MODEL` overrides the shared default; role-specific
+settings take precedence. `KIMI_BASE_URL` defaults to
+`https://api.moonshot.ai/v1`.
+
+To select OpenAI explicitly, set `AI_PROVIDER=openai` and `OPENAI_API_KEY`;
+the existing `OPENAI_*_MODEL` overrides still apply to that provider. Kimi uses
+only its own key and model overrides. Add the Kimi variables to the API hosting
+environment when deploying; the local `.env` is ignored by Git.
+
+See [the Kimi model audit](docs/kimi-model-audit.md) for model selection and API
+compatibility notes.
+
 [Learn more about this workspace setup and its capabilities](https://nx.dev/nx-api/js?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) or run `npx nx graph` to visually explore what was created. Now, let's get you up to speed!
 
 ## Generate a library
