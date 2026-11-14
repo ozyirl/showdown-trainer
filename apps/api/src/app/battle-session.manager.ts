@@ -21,6 +21,10 @@ import {
   type ShowdownRequest,
 } from './battle.service';
 import { CpuMoveAiService, type CpuStreamEvent } from './cpu-move-ai.service';
+import { FlyCnsService } from './fly-cns.service';
+import { PlayerProtocolRecorder } from './player-protocol';
+
+const FLY_CNS_MODEL_ID = 'fly-cns';
 
 export interface BattlePokemonState {
   slot: number;
@@ -255,6 +259,8 @@ class BattleSession {
   copilotMode?: CopilotMode;
   cpuModelProfile?: CpuModelProfile;
   gameMode: GameMode = 'pvp';
+  formatid = 'gen9customgame';
+  protocol?: PlayerProtocolRecorder;
   p1Choice: string | null = null;
   p2Choice: string | null = null;
   turnLog: string[] = [];
@@ -307,7 +313,8 @@ export class BattleSessionManager {
 
   constructor(
     private readonly battleService: BattleService,
-    private readonly cpuMoveAiService: CpuMoveAiService
+    private readonly cpuMoveAiService: CpuMoveAiService,
+    private readonly flyCnsService: FlyCnsService
   ) {}
 
   getSessionForCopilot(battleId: string): {
@@ -382,8 +389,10 @@ export class BattleSessionManager {
       randomSeed: this.seedForSide(config?.randomSeed, 1),
     });
 
+    const protocol = new PlayerProtocolRecorder((): string[] => battle.log);
     const battle = new Battle({
       formatid,
+      send: protocol.send,
     });
 
     battle.setPlayer('p1', {
@@ -419,6 +428,8 @@ export class BattleSessionManager {
     session.copilotMode = copilotMode;
     session.cpuModelProfile = cpuModelProfile;
     session.gameMode = normalizeGameMode(config?.gameMode);
+    session.formatid = formatid;
+    session.protocol = protocol;
 
     session.lastLogIndex = battle.log.length;
     session.currentTurn = (battle as unknown as { turn?: number }).turn ?? 0;
@@ -1405,6 +1416,13 @@ export class BattleSessionManager {
     );
     const switchChoices = this.getLegalCpuSwitchChoices(requests[side], legal);
 
+    if (session.cpuModelProfile === 'fly') {
+      await this.chooseFlyCnsAction(session, side, legal, () =>
+        this.getFallbackCpuChoice(moveChoices, switchChoices, !!legal.forceSwitch)
+      );
+      return;
+    }
+
     if (!this.isCpuAiEnabled()) {
       const fallback = this.getFallbackCpuChoice(
         moveChoices,
@@ -1570,6 +1588,51 @@ export class BattleSessionManager {
           status: parsed.status,
         };
       });
+  }
+
+  private async chooseFlyCnsAction(
+    session: BattleSession,
+    side: 'p1' | 'p2',
+    legal: ShowdownLegalOptions,
+    fallback: () => { choice: string; actionType: 'move' | 'switch' | 'default' }
+  ): Promise<void> {
+    const decisionField = side === 'p2' ? 'lastCpuDecision' : 'lastP1AiDecision';
+    const startedAt = Date.now();
+    try {
+      if (!session.protocol) {
+        throw new Error('Battle has no protocol recording');
+      }
+      const decision = await this.flyCnsService.choose(
+        session.formatid,
+        session.protocol.linesFor(side)
+      );
+      if (!legal.allChoices.includes(decision.choice)) {
+        throw new Error(`Fly CNS chose "${decision.choice}", which is not legal here`);
+      }
+      session.setChoice(side, decision.choice);
+      session[decisionField] = {
+        choice: decision.choice,
+        actionType: decision.choice.startsWith('switch') ? 'switch' : 'move',
+        source: 'model',
+        modelId: FLY_CNS_MODEL_ID,
+        latencyMs: Date.now() - startedAt,
+        reasoning: `Fly CNS action ${decision.action_index} (state value ${decision.state_value.toFixed(2)})`,
+        turn: session.currentTurn + 1,
+      };
+    } catch (error) {
+      const action = fallback();
+      session.setChoice(side, action.choice);
+      session[decisionField] = {
+        choice: action.choice,
+        actionType: action.actionType,
+        source: 'fallback',
+        modelId: FLY_CNS_MODEL_ID,
+        latencyMs: Date.now() - startedAt,
+        reasoning: 'Fallback action after Fly CNS error',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        turn: session.currentTurn + 1,
+      };
+    }
   }
 
   private getFallbackCpuChoice(

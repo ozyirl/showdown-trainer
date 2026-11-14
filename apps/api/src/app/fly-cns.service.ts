@@ -1,6 +1,15 @@
 import { Injectable } from '@nestjs/common';
 import axios from 'axios';
 
+const CHOOSE_TIMEOUT_MS = 5000;
+
+export interface FlyCnsChoice {
+  choice: string;
+  action_index: number;
+  turn: number;
+  state_value: number;
+}
+
 @Injectable()
 export class FlyCnsService {
   private readonly baseUrl = (
@@ -9,6 +18,19 @@ export class FlyCnsService {
 
   async health(): Promise<unknown> {
     const response = await axios.get<unknown>(`${this.baseUrl}/health`);
+    return response.data;
+  }
+
+  /**
+   * Ask the Fly CNS policy for a choice, given everything one player has seen so far.
+   * Tera and other gimmicks stay off because battles here only accept moves and switches.
+   */
+  async choose(format: string, protocol: string[]): Promise<FlyCnsChoice> {
+    const response = await axios.post<FlyCnsChoice>(
+      `${this.baseUrl}/v1/choose`,
+      { format, protocol, gimmicks: false },
+      { timeout: CHOOSE_TIMEOUT_MS }
+    );
     return response.data;
   }
 

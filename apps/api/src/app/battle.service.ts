@@ -31,7 +31,7 @@ export interface PokemonMoveItem {
 }
 
 export type CopilotMode = 'off' | 'coach' | 'deep';
-export type CpuModelProfile = 'fast' | 'reasoning';
+export type CpuModelProfile = 'fast' | 'reasoning' | 'fly';
 export type GameMode = 'pvp' | 'ai-vs-ai';
 
 export interface StartBattleRequest {
@@ -81,6 +81,7 @@ export function normalizeCpuModelProfile(
   switch ((value ?? '').trim().toLowerCase()) {
     case 'fast':
     case 'reasoning':
+    case 'fly':
       return value!.trim().toLowerCase() as CpuModelProfile;
     default:
       return undefined;

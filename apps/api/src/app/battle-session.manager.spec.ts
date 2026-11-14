@@ -5,6 +5,7 @@ import {
   type BattleState,
 } from './battle-session.manager';
 import { CpuMoveAiService } from './cpu-move-ai.service';
+import { FlyCnsService } from './fly-cns.service';
 
 describe('BattleSessionManager 6v6 flow', () => {
   let battleService: BattleService;
@@ -15,7 +16,11 @@ describe('BattleSessionManager 6v6 flow', () => {
     process.env.ENABLE_CPU_AI = 'false';
     battleService = new BattleService();
     cpuMoveAiService = new CpuMoveAiService();
-    manager = new BattleSessionManager(battleService, cpuMoveAiService);
+    manager = new BattleSessionManager(
+      battleService,
+      cpuMoveAiService,
+      new FlyCnsService()
+    );
   });
 
   async function ackUntilSettled(
@@ -235,7 +240,11 @@ describe('BattleSessionManager 6v6 flow', () => {
       chooseCpuMove: jest.fn(),
     } as unknown as CpuMoveAiService;
 
-    const localManager = new BattleSessionManager(battleServiceMock, cpuMock);
+    const localManager = new BattleSessionManager(
+      battleServiceMock,
+      cpuMock,
+      new FlyCnsService()
+    );
     const fakeSession = {
       id: 'fake-battle',
       battle: {
@@ -371,7 +380,11 @@ describe('BattleSessionManager 6v6 flow', () => {
       chooseCpuMove: jest.fn(),
     } as unknown as CpuMoveAiService;
 
-    const localManager = new BattleSessionManager(battleServiceMock, cpuMock);
+    const localManager = new BattleSessionManager(
+      battleServiceMock,
+      cpuMock,
+      new FlyCnsService()
+    );
     const fakeSession = {
       id: 'fake-battle-switch',
       battle: {
@@ -524,7 +537,11 @@ describe('BattleSessionManager 6v6 flow', () => {
       chooseCpuMove: jest.fn(),
     } as unknown as CpuMoveAiService;
 
-    const localManager = new BattleSessionManager(battleServiceMock, cpuMock);
+    const localManager = new BattleSessionManager(
+      battleServiceMock,
+      cpuMock,
+      new FlyCnsService()
+    );
     const fakeSession = {
       id: 'fake-battle-heal',
       battle: {
