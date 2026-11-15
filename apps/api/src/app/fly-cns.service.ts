@@ -3,11 +3,39 @@ import axios from 'axios';
 
 const CHOOSE_TIMEOUT_MS = 5000;
 
+/** The spike simulation and policy readout behind one Fly CNS decision. */
+export interface FlyCnsDiagnostics {
+  total_spikes: number;
+  active_neurons: number;
+  neuron_count: number;
+  sensory_neurons_stimulated: number;
+  steps: number | null;
+  spikes_per_step: number[];
+  populations: {
+    key: string;
+    label: string;
+    neurons: number;
+    active: number;
+    spikes: number;
+    first_spike_step: number | null;
+  }[];
+  top_descending: { root_id: number; cell_type: string; spikes: number }[];
+  actions: {
+    index: number;
+    choice: string;
+    label: string;
+    probability: number;
+    selected: boolean;
+  }[];
+  state_value: number;
+}
+
 export interface FlyCnsChoice {
   choice: string;
   action_index: number;
   turn: number;
   state_value: number;
+  diagnostics?: FlyCnsDiagnostics;
 }
 
 @Injectable()

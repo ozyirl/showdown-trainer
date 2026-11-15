@@ -21,7 +21,7 @@ import {
   type ShowdownRequest,
 } from './battle.service';
 import { CpuMoveAiService, type CpuStreamEvent } from './cpu-move-ai.service';
-import { FlyCnsService } from './fly-cns.service';
+import { FlyCnsService, type FlyCnsDiagnostics } from './fly-cns.service';
 import { PlayerProtocolRecorder } from './player-protocol';
 
 const FLY_CNS_MODEL_ID = 'fly-cns';
@@ -140,6 +140,8 @@ export interface BattleState {
     rawResponse?: string;
     error?: string;
     truncated?: boolean;
+    /** Brain activity and action probabilities behind a Fly CNS decision. */
+    flyCns?: FlyCnsDiagnostics;
     turn: number;
   } | null;
   lastP1AiDecision: BattleState['lastCpuDecision'];
@@ -1617,6 +1619,7 @@ export class BattleSessionManager {
         modelId: FLY_CNS_MODEL_ID,
         latencyMs: Date.now() - startedAt,
         reasoning: `Fly CNS action ${decision.action_index} (state value ${decision.state_value.toFixed(2)})`,
+        flyCns: decision.diagnostics,
         turn: session.currentTurn + 1,
       };
     } catch (error) {
