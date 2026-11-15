@@ -53,11 +53,15 @@ export class FlyCnsService {
    * Ask the Fly CNS policy for a choice, given everything one player has seen so far.
    * Tera and other gimmicks stay off because battles here only accept moves and switches.
    */
-  async choose(format: string, protocol: string[]): Promise<FlyCnsChoice> {
+  async choose(
+    format: string,
+    protocol: string[],
+    options?: { timeoutMs?: number }
+  ): Promise<FlyCnsChoice> {
     const response = await axios.post<FlyCnsChoice>(
       `${this.baseUrl}/v1/choose`,
       { format, protocol, gimmicks: false },
-      { timeout: CHOOSE_TIMEOUT_MS }
+      { timeout: options?.timeoutMs ?? CHOOSE_TIMEOUT_MS }
     );
     return response.data;
   }

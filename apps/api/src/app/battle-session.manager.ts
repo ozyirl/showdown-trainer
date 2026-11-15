@@ -5,7 +5,16 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import type { Battle } from 'pokemon-showdown';
-import { Observable } from 'rxjs';
+import { Observable, ReplaySubject, merge } from 'rxjs';
+import {
+  FLY_CNS_RETRY_POLICY,
+  RetryFailedError,
+  describeError,
+  isTransientHttpError,
+  retryWithBackoff,
+  type CpuRetryStreamEvent,
+  type RetryPolicy,
+} from './ai-retry';
 import {
   BattleService,
   StartBattleRequest,
@@ -21,7 +30,11 @@ import {
   type ShowdownRequest,
 } from './battle.service';
 import { CpuMoveAiService, type CpuStreamEvent } from './cpu-move-ai.service';
-import { FlyCnsService, type FlyCnsDiagnostics } from './fly-cns.service';
+import {
+  FlyCnsService,
+  type FlyCnsChoice,
+  type FlyCnsDiagnostics,
+} from './fly-cns.service';
 import { PlayerProtocolRecorder } from './player-protocol';
 
 const FLY_CNS_MODEL_ID = 'fly-cns';
@@ -140,6 +153,8 @@ export interface BattleState {
     rawResponse?: string;
     error?: string;
     truncated?: boolean;
+    /** Model calls made for this decision, including retries. */
+    attempts?: number;
     /** Brain activity and action probabilities behind a Fly CNS decision. */
     flyCns?: FlyCnsDiagnostics;
     turn: number;
@@ -312,6 +327,9 @@ class BattleSession {
 @Injectable()
 export class BattleSessionManager {
   private sessions = new Map<string, BattleSession>();
+  /** Retry status for the CPU stream, kept apart from the LLM token stream. */
+  private retryStreams = new Map<string, ReplaySubject<CpuRetryStreamEvent>>();
+  private flyRetryPolicy: RetryPolicy = FLY_CNS_RETRY_POLICY;
 
   constructor(
     private readonly battleService: BattleService,
@@ -349,12 +367,28 @@ export class BattleSessionManager {
     };
   }
 
-  getCpuStream(battleId: string): Observable<CpuStreamEvent> {
+  getCpuStream(
+    battleId: string
+  ): Observable<CpuStreamEvent | CpuRetryStreamEvent> {
     const session = this.sessions.get(battleId);
     if (!session) {
       throw new NotFoundException('Battle not found');
     }
-    return this.cpuMoveAiService.getBattleStream(battleId).asObservable();
+    return merge(
+      this.cpuMoveAiService.getBattleStream(battleId).asObservable(),
+      this.ensureRetryStream(battleId).asObservable()
+    );
+  }
+
+  private ensureRetryStream(
+    battleId: string
+  ): ReplaySubject<CpuRetryStreamEvent> {
+    let stream = this.retryStreams.get(battleId);
+    if (!stream) {
+      stream = new ReplaySubject<CpuRetryStreamEvent>(64);
+      this.retryStreams.set(battleId, stream);
+    }
+    return stream;
   }
 
   async createBattle(config?: StartBattleRequest): Promise<BattleState> {
@@ -852,6 +886,7 @@ export class BattleSessionManager {
     this.sessions.delete(battleId);
     this.battleService.unregisterBattleSession(battleId);
     this.cpuMoveAiService.clearBattleStream(battleId);
+    this.retryStreams.delete(battleId);
   }
 
   private normalizeTeamPreviewChoice(
@@ -1600,14 +1635,18 @@ export class BattleSessionManager {
   ): Promise<void> {
     const decisionField = side === 'p2' ? 'lastCpuDecision' : 'lastP1AiDecision';
     const startedAt = Date.now();
+    let attempts = 0;
     try {
       if (!session.protocol) {
         throw new Error('Battle has no protocol recording');
       }
-      const decision = await this.flyCnsService.choose(
-        session.formatid,
+      const result = await this.requestFlyCnsChoice(
+        session,
+        side,
         session.protocol.linesFor(side)
       );
+      attempts = result.attempts;
+      const decision = result.decision;
       if (!legal.allChoices.includes(decision.choice)) {
         throw new Error(`Fly CNS chose "${decision.choice}", which is not legal here`);
       }
@@ -1620,9 +1659,16 @@ export class BattleSessionManager {
         latencyMs: Date.now() - startedAt,
         reasoning: `Fly CNS action ${decision.action_index} (state value ${decision.state_value.toFixed(2)})`,
         flyCns: decision.diagnostics,
+        attempts,
         turn: session.currentTurn + 1,
       };
+      this.emitRetrySettled(session, side, attempts, 'model');
     } catch (error) {
+      const retryFailure = error instanceof RetryFailedError ? error : null;
+      if (retryFailure) {
+        attempts = retryFailure.attempts;
+      }
+      const message = describeError(error);
       const action = fallback();
       session.setChoice(side, action.choice);
       session[decisionField] = {
@@ -1631,11 +1677,70 @@ export class BattleSessionManager {
         source: 'fallback',
         modelId: FLY_CNS_MODEL_ID,
         latencyMs: Date.now() - startedAt,
-        reasoning: 'Fallback action after Fly CNS error',
-        error: error instanceof Error ? error.message : 'Unknown error',
+        reasoning:
+          retryFailure && retryFailure.reason !== 'non-retryable'
+            ? `Fallback after ${attempts} failed attempt${attempts === 1 ? '' : 's'}` +
+              (retryFailure.reason === 'budget' ? ' (time budget used up)' : '')
+            : 'Fallback action after Fly CNS error',
+        error: message,
+        attempts,
         turn: session.currentTurn + 1,
       };
+      this.emitRetrySettled(session, side, attempts, 'fallback', message);
     }
+  }
+
+  /**
+   * Call the Fly CNS service, retrying network errors, timeouts and 5xx with a short
+   * backoff inside an overall time budget. A 422 ("Cannot choose") is not retried.
+   */
+  private async requestFlyCnsChoice(
+    session: BattleSession,
+    side: 'p1' | 'p2',
+    protocol: string[]
+  ): Promise<{ decision: FlyCnsChoice; attempts: number }> {
+    const turn = session.currentTurn + 1;
+    const { value, attempts } = await retryWithBackoff(
+      ({ timeoutMs }) =>
+        this.flyCnsService.choose(session.formatid, protocol, { timeoutMs }),
+      this.flyRetryPolicy,
+      {
+        isRetryable: isTransientHttpError,
+        onRetry: ({ attempt, maxAttempts, delayMs, error }) =>
+          this.ensureRetryStream(session.id).next({
+            type: 'retry',
+            side,
+            turn,
+            modelId: FLY_CNS_MODEL_ID,
+            attempt,
+            maxAttempts,
+            delayMs,
+            error: describeError(error),
+          }),
+      }
+    );
+    return { decision: value, attempts };
+  }
+
+  /** Tell the stream a retried decision is over; stays quiet when nothing was retried. */
+  private emitRetrySettled(
+    session: BattleSession,
+    side: 'p1' | 'p2',
+    attempts: number,
+    source: 'model' | 'fallback',
+    error?: string
+  ): void {
+    if (attempts <= 1) return;
+    this.ensureRetryStream(session.id).next({
+      type: 'retry-settled',
+      side,
+      turn: session.currentTurn + 1,
+      modelId: FLY_CNS_MODEL_ID,
+      attempts,
+      maxAttempts: this.flyRetryPolicy.maxAttempts,
+      source,
+      error,
+    });
   }
 
   private getFallbackCpuChoice(
