@@ -14,7 +14,11 @@ import {
   type BattleWithDex,
   type BattleSideLike,
 } from './battle-session.manager';
-import type { BattleService, ShowdownRequest } from './battle.service';
+import type {
+  BattleService,
+  CopilotMode,
+  ShowdownRequest,
+} from './battle.service';
 import { COPILOT_SYSTEM_PROMPT } from './system-prompts';
 
 // ---------------------------------------------------------------------------
@@ -60,6 +64,24 @@ const CopilotGuidanceExtractorSchema = CopilotGuidanceSchema.omit({
 });
 
 export type CopilotGuidance = z.infer<typeof CopilotGuidanceSchema>;
+
+/**
+ * Guidance plus metadata describing the coach call that produced it.
+ * The metadata is not part of the model's output schema, so neither the
+ * coach model nor the extractor is asked to produce it.
+ */
+export type CopilotGuidanceResponse = CopilotGuidance & {
+  /** The coach model that was called for this guidance. */
+  modelId?: string;
+  copilotMode?: CopilotMode;
+  latencyMs?: number;
+  /**
+   * "model": parsed directly from the coach model's output.
+   * "extractor": recovered from the coach output by the extractor model.
+   * "fallback": the coach call failed or its output could not be parsed.
+   */
+  source?: 'model' | 'extractor' | 'fallback';
+};
 
 // ---------------------------------------------------------------------------
 // Snapshot types (AI-friendly structured input)
@@ -130,7 +152,7 @@ export class CopilotService {
    * Per-battle guidance cache keyed by "battleId::turn::phase".
    * Prevents redundant LLM calls on page reload or re-render.
    */
-  private readonly guidanceCache = new Map<string, CopilotGuidance>();
+  private readonly guidanceCache = new Map<string, CopilotGuidanceResponse>();
 
   constructor(private readonly battleSessionManager: BattleSessionManager) {}
 
@@ -159,12 +181,20 @@ export class CopilotService {
       cacheKey,
       reasoning,
       copilotEnabled: session.copilotEnabled,
+      copilotMode: session.copilotMode,
     };
   }
 
-  async getCopilotGuidance(battleId: string): Promise<CopilotGuidance> {
-    const { snapshot, modelId, prompt, cacheKey, reasoning, copilotEnabled } =
-      this.prepareCopilotCall(battleId);
+  async getCopilotGuidance(battleId: string): Promise<CopilotGuidanceResponse> {
+    const {
+      snapshot,
+      modelId,
+      prompt,
+      cacheKey,
+      reasoning,
+      copilotEnabled,
+      copilotMode,
+    } = this.prepareCopilotCall(battleId);
 
     if (!copilotEnabled) {
       return {
@@ -192,6 +222,16 @@ export class CopilotService {
     );
 
     const startedAt = Date.now();
+    const withMeta = (
+      guidance: CopilotGuidance,
+      source: NonNullable<CopilotGuidanceResponse['source']>
+    ): CopilotGuidanceResponse => ({
+      ...guidance,
+      modelId,
+      copilotMode,
+      latencyMs: Date.now() - startedAt,
+      source,
+    });
     try {
       const { text: rawText } = await generateText({
         model: createModel(modelId, reasoning),
@@ -212,8 +252,9 @@ export class CopilotService {
             directParsed.recommendedAction
           } [${directParsed.confidence}]`
         );
-        this.guidanceCache.set(cacheKey, directParsed);
-        return directParsed;
+        const result = withMeta(directParsed, 'model');
+        this.guidanceCache.set(cacheKey, result);
+        return result;
       }
 
       if (reasoning) {
@@ -226,21 +267,25 @@ export class CopilotService {
         this.logger.debug(
           `Copilot step2 (${totalMs}ms, ${extractorModelId}): ${extractorResult.recommendedAction} [${extractorResult.confidence}]`
         );
-        this.guidanceCache.set(cacheKey, extractorResult);
-        return extractorResult;
+        const result = withMeta(extractorResult, 'extractor');
+        this.guidanceCache.set(cacheKey, result);
+        return result;
       }
 
       this.logger.warn(
         `Copilot parse failed (${Date.now() - startedAt}ms), using fallback`
       );
-      const fallback = this.buildFallbackGuidance(snapshot);
+      const fallback = withMeta(
+        this.buildFallbackGuidance(snapshot),
+        'fallback'
+      );
       this.guidanceCache.set(cacheKey, fallback);
       return fallback;
     } catch (error) {
       const latencyMs = Date.now() - startedAt;
       const message = error instanceof Error ? error.message : 'Unknown error';
       this.logger.error(`Copilot error (${latencyMs}ms): ${message}`);
-      return this.buildFallbackGuidance(snapshot);
+      return withMeta(this.buildFallbackGuidance(snapshot), 'fallback');
     }
   }
 
