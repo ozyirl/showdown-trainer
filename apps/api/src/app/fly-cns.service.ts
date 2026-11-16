@@ -28,6 +28,12 @@ export interface FlyCnsDiagnostics {
     selected: boolean;
   }[];
   state_value: number;
+  /** Per-neuron first spike step (255 = never) and spike count, as base64 bytes. */
+  neuron_activity?: {
+    graph: string;
+    first_spike_step: string;
+    spikes: string;
+  } | null;
 }
 
 export interface FlyCnsChoice {
